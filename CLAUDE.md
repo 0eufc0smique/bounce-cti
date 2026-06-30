@@ -540,3 +540,17 @@ later), prefix the commit subject with `docs:` so the intent is obvious in `git 
 - The `data/` directory is gitignored but must survive deploys (SQLite DB, auth key).
 - WebSocket endpoint is `/ws/{investigation_id}` — reverse proxy must support upgrade headers.
 - Every push to `main` deploys to production (see "Deployment & CI/CD"). There is no staging.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues (`0eufc0smique/bounce-cti`) via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical triage roles map to default label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
