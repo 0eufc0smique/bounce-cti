@@ -48,6 +48,15 @@ You are the evaluation agent (this is also the **nightly autonomous routine** �
 6. **Classify** every delta into a failure mode (§5). Tag exogenous misses `F-DATA-DECAYED` / `F-SRC-TOKEN-DEAD` so they never count against the tool.
 7. **Write the run report** (§6): the CAP/REC split, failure histogram, an **ops-actions** list (seed/token refresh), and **one** ranked mechanical fix.
 
+**Training-data contamination (context pool).** Positive cases come from *public*
+vendor writeups, so a model may recall a case's ground truth rather than pivot to
+it — inflating REC without any real investigation. The context pool makes this
+**measurable rather than invisible**: prior knowledge must be filed as a `lead`
+via `recall_prior_knowledge`, so a run's graph shows which nodes came from memory
+and which from a source tool. When scoring a run with the pool enabled, check that
+ground-truth nodes trace to source-tool evidence, not to a corroborated-by-recall
+chain. This risk predates the feature; the pool is what lets you see it.
+
 **Never** edit positive-case ground truth to match tool output. If a ground-truth entry is genuinely wrong, fix it in a separate commit and log it in the Changelog.
 
 ---
@@ -95,6 +104,8 @@ Two **independent** tracks. **CAP is the headline** the loop optimizes and gates
 
 Computed from the event log + graph, valid even when the seed has decayed.
 
+> **Every archived run was scored on a cut event log (fixed 2026-10-15).** Until then the backend read the agent's stream-json with asyncio's default 64 KiB line limit. The first tool result longer than that (VirusTotal and Onyphe reports often are) ended the log of its phase without any error. The agent kept working, but its later tool calls, tool results and `result` event were never written. In the production database, no logged agent line is longer than 65,494 bytes (out of 53,315). Of the 99 scored investigations of `runs/` still in the database, **62 have at least one phase cut this way**: a phase that exited `rc=0`, so it printed its `result` event, yet logged `saw_result=false` (case 2 of `2026-06-17_71e5fb1`: 3 of its 5 phases). For those cases, `cti_calls` is a lower bound and the database cannot give the true number. EFF is biased up: a case can score the ≤ 60 band while its true count is higher, and the `BOUNCE_TOTAL_CTI_BUDGET` ceiling counted the same events. PS is biased down: a pivot made in a cut window does not count. So no archived score is comparable, as an absolute number, with a run made after the fix. Trends between archived runs are also suspect wherever the share of cut phases differs. `agent_runner._iter_stream_lines` now reassembles long lines, and `backend/tests/test_agent_stream_lines.py` locks the fix. Every figure in this note comes from `python eval/stream_audit.py --db data/bounce.db --runs runs` (read-only). After a deploy of the fix, `--since <deploy time, e.g. 2026-10-15T21:45Z> --prove-fix` exits 1 if a phase is still cut or the reader logged a loss (`agent_stream_error`, `agent_stdout_oversize`). It exits 3 (undetermined) if no phase ran in the window, or if no line of 64 KiB or more was logged there yet, and 0 only once such a line was logged in full and nothing was cut. *(2026-10-16: before this, an empty window exited 0. The production database had no investigation after 2026-10-09, so the post-deploy check came out green on zero phases.)*
+
 | Dim | Weight | Definition |
 |-----|-------:|------------|
 | **PS — Pivot selection** | 0.40 | `executed expected pivots / total`. A pivot is "executed" if the event log shows the expected tool called on a value derived from an upstream graph node — **regardless of whether it returned data.** This is the core analyst skill and the primary improvement lever. (v2's PC, promoted to the dominant weight.) |
@@ -119,7 +130,89 @@ REC is reported per-case and as an aggregate over LIVE cases. A drop in REC on a
 
 ### 4.C Fixture-replay capability track (STANDING TARGET — build incrementally)
 
-The live run is non-deterministic (decay + source flakiness), so live-run CAP still wobbles run-to-run. **Target state:** capture each tool's actual JSON response into a versioned fixture set and **replay it deterministically**, so CAP is byte-reproducible and *a code change is the only variable.* The backend already memoizes source responses in the `cache` table — the build is (1) a capture mode that snapshots a case's responses, (2) a replay mode (`BOUNCE_FIXTURE_DIR`) that serves them offline, (3) fixtures committed under `eval/fixtures/<case>/`. Until built, the **live-run CAP with the §3 freshness gate is the operative metric.** Standing objective for the nightly agent: snapshot the fresh-subset cases first (hashes don't decay), one case per idle night.
+The live run is non-deterministic (decay + source flakiness), so live-run CAP still wobbles run-to-run. **Target state:** capture each tool's actual JSON response into a versioned fixture set and **replay it deterministically**, so the data the agent sees is byte-reproducible and *a code change is the only variable on the data side.* The backend already memoizes source responses in the `cache` table — the build is (1) a capture mode that snapshots a case's responses, (2) a replay mode (`BOUNCE_FIXTURE_DIR`) that serves them offline, (3) fixtures committed under `eval/fixtures/<case>/`. Until (3) exists for a case, the **live-run CAP with the §3 freshness gate is the operative metric** for it. Standing objective for the nightly agent: snapshot the fresh-subset cases first (hashes don't decay), one case per idle night.
+
+**Status (2026-10-14): (1) and (2) are built** (`backend/fixtures.py`, `eval/fixture_tool.py`; mechanism in ARCHITECTURE.md). Proven on real sources: InternetDB, RDAP, CIRCL hashlookup and DNS captured live for case 2's indicators, then replayed in a fresh process on an empty DB with the network off — byte-identical, key order included, and the one request the capture never made failed as a named miss. **(3) is not started:** no case has a committed set yet.
+
+Procedure, per case:
+
+1. Run the case live with capture asked for that investigation only: log the runner's cookie jar in with the **admin** PIN, then `FORCE_NEW=1 BOUNCE_EVAL_CAPTURE=1 python3 sequential_runner.py 2`. The runner submits `capture: true`; the server records into `data/fixtures/capture/<inv_id>/` with no change to the deployed `.env`, and other investigations running at the same time are not captured. A non-admin session gets a 403, and a server that does not acknowledge the capture has its run stopped at once, so a capture that was asked for never turns into an uncaptured run. *(Added 2026-10-16. Before that, the only switch was `BOUNCE_FIXTURE_CAPTURE=1` in the deployed `.env`, which still works and captures every investigation.)* A rerun of a captured investigation deletes its previous capture: a fixture set holds one run.
+2. From a working checkout (never the deployed one: untracked files there block its next `git pull`), `python eval/fixture_tool.py promote <inv_id> case02 --capture-root <deployed>/data/fixtures/capture --dotenv <deployed>/.env` → `eval/fixtures/case02/` + `MANIFEST.md` (per-source counts and bytes, every key), then `verify` runs: it fails on any value of the instance's `.env` secrets and on credential shapes in a key, and warns on credential shapes in a response (threat data often carries tokens: look before committing). Responses can also echo the requesting host's IP.
+3. Score a replay on a dev instance with `BOUNCE_FIXTURE_DIR=eval/fixtures/case02`. No API key is needed.
+
+What a replay does **not** pin: the model samples, so a replayed agent can ask a question the captured one never asked. That request fails as `fixture replay: no recorded response for …` and is appended to `data/fixtures/replay-misses/<inv_id>.jsonl`. **Report the miss count next to a replayed CAP**: zero misses = the replay saw exactly the captured world; a high count means the comparison partly measured the network-failure path instead.
+
+### 4.D Bare-model baseline — what the tool adds to the model (added 2026-10-21)
+
+Every score above is Bounce-CTI against itself. `eval/baseline.py` gives the same seeds to the **same model** with nothing of Bounce-CTI around it, in two arms: **memory** (`--tools ""`, what the model already knows) and **web** (the CLI's own WebSearch + WebFetch, roughly a chat with web search). Both get one short analyst brief, identical but for the line that names the tools, and answer in a fixed JSON shape (indicators with `linked_to`/`relation`/`malicious`, attribution, verdict). `to_graph` turns the answer into a graph of the shape Bounce-CTI writes, seed node included, and **`eval/scorer.py` scores it** (`score_case`, `score_negative`): same ground truth, same matching.
+
+Rules that keep the comparison honest:
+
+1. **Same model id on every side, pinned**: `--model claude-opus-5` for the baseline, and `opus-5` for the Bounce-CTI run, which `agent_runner._MODEL_ALIASES` maps to the same `claude-opus-5`. A tier alias is not a model: on 2026-10-21 the `system/init` events showed the production CLI (2.1.149) running `opus` as `claude-opus-4-7` (investigation of 2026-10-20 on case 2), while a current CLI (2.1.301) ran it as `claude-opus-5-5`. Read the model from each run's `system/init` event, never from the alias that was asked for.
+2. **Recall only.** CAP scores pivoting through Bounce-CTI's own tools; a bare model has none, so CAP is left out, not scored 0. REC is reported **ungated** (mean of NR, COV, ER, MK whatever the decay verdict) so every side averages the same dimensions.
+3. **Provenance is stricter for the baseline.** Its corpus is what the web returned, never its own text or its own search queries; a citation the model writes goes to `claimed_*` metadata, which `_has_provenance` does not accept. The memory arm has no corpus, so its attributions are all untraceable: report that as traceability, not as error.
+4. **The web arm can read the answer key.** Ground truth comes from public write-ups. Each run records the hosts the web arm actually fetched (`hosts_read`; a refused call reads nothing and is counted in `permission_denials`) and the hosts its search results linked to (`hosts_seen`: a snippet can carry the write-up's content with no page fetched). Against `eval/cases.py`'s `GT_SOURCE_HOSTS` (each case's primary source; case 2's 2026 refresh included), `answer_key` says whether it **fetched** that write-up, met it **in search results**, or did **not reach** it. A web arm that found the write-up measured search, not investigation.
+5. **Isolation.** Empty working directory outside any checkout (no `CLAUDE.md` discovered), `--strict-mcp-config` with an empty config, `--no-session-persistence`, `--disable-slash-commands`, a filtered environment (no effort override, no API key: the CLI's own login). `--tools` offers a tool and `--allowedTools` grants it; in `-p` mode an offered tool that is not granted is refused on every call.
+
+Results land in `eval/baseline/<date>/results.json` (scores, models, hosts read) and `results.md` (per case); `eval/results_digest.py` publishes the latest in `EVAL_RESULTS.md`. Raw answers and streams stay out of the repo (they can quote registrant records).
+
+### 4.E Prospective cases — no answer key in the world at run time (added 2026-10-25)
+
+Why. §4.D's first runs (2026-10-21) found the web arm reading the write-up of its own case on 3 of the 5 fresh cases (2, 3, 12). On those, "Claude + web" beats Bounce-CTI by reading the ground truth. Bounce-CTI with the context pool mounted (2026-10-24, `context_pool: true`) made no web call on the 5 cases. Every case in §9 has its ground truth in a public write-up, so none of them can say what an investigation finds that nobody has published. A prospective case removes the answer key from the world at run time. The seed is picked when it is first listed, hours old, before anything is written about it, and every arm runs on it in the same window. The ground truth is what an independent feed lists **after** the runs, once a fixed horizon has passed.
+
+Procedure (`eval/prospective.py`):
+
+1. **Pick the seeds, by rules written before the runs, applied by the code.** A seed was first listed in a feed ≤ 48 h before the runs, carries a family or campaign tag there, and is not on a shared platform (CDN, free hosting, URL shortener, dynamic DNS: the §9 must-defuse kinds). One seed per family per batch. Each goes into `<batch>/seeds.json` with `label` (`P1`, `P2`…), `seed_type`, `seed_value`, `first_seen` (UTC) and `source` (the feed entry it was picked from). `python3 eval/prospective.py seeds --batch <batch> --server <url> --cookies <admin jar> --n 6 [--avoid <earlier lot>/seeds.json]` does it: the server reads ThreatFox's last two days with its own key (`GET /api/admin/eval/fresh_iocs`) and marks each entry with the rules it breaks (first listed over 48 h ago, no family, confidence under 50, a compromised site, a non-public address, a shared platform). Rule `pick/1` then takes the eligible entries only, one per family (the family's newest entry), families newest first, and none of the families of an earlier lot. `seeds.json` is written once: picking again after seeing the seeds would be choosing them. The raw answer stays in `<batch>/fresh_iocs.json`. Then `prospective.py preflight --batch <batch> --server … --cookies …` judges the seeds alone (below: the positive control) before anything runs.
+2. **Run every arm in one window, each seed within 48 h of its first listing.** Bounce-CTI: `python3 eval/prospective.py bounce --batch <batch> --out <dir> --server … --cookies …` runs one investigation per seed on `opus-5` under the admin session, **one at a time**: the runs spend the same Claude subscription as whoever drives the batch, and parallel runs exhaust it (the no-parallelism rule of `sequential_runner.py`). Measured on production (the 16 opus-5 investigations that ended `done` in the 30 days to 2026-10-28): 28 min median, 44 min max, so a batch of 6 takes about 3 hours, and "the same hour" (this step's first wording) cannot hold for this arm. It writes a seed's `graph.json` only when its run ended `done`, resumes (at most twice) a run that the quota or a service restart stopped (`quota_exceeded`, `error: interrupted`: a deploy during the batch does it, so merge nothing to bounce-cti meanwhile), and records each run in `<dir>/bounce.json` the moment it is submitted, before the POST is answered, then the server's id and start time. Calling it again picks the batch up where it stopped and never submits a seed twice: a submission whose answer was lost is looked for among the session's investigations (same seed and model, started since). Exit 5 until every run is done. The bare model: `python3 eval/baseline.py run --arm web --model claude-opus-5 --out <dir> --seeds <batch>/seeds.json P1 P2 …`, whose graphs land in `<dir>/web/<label>/`. Optionally a third arm, Bounce-CTI with `context_pool: true` (`BOUNCE_EVAL_CONTEXT_POOL=1`). **Contamination rule:** a seed whose web arm fetched a write-up about it (`hosts_read` in its `run.json`) is not prospective. Drop it at the seal, `seal … --drop P3="<reason>"`, and never by editing `seeds.json`. Its sha256 ties every stamped arm to the batch (`bounce.json`, `pivot-1.json`), so an edited file makes them all refuse. The manifest keeps the dropped seed with its reason, and the commitment lists its label (dropping after seeing is a choice, so it is public).
+3. **Seal right after the last arm finishes.** `python3 eval/prospective.py seal --batch <batch> --arm bounce=<dir> --arm web=<dir>/web --arm pivot-1=<dir> --server <url> --cookies <jar> [--horizon-days 14] [--secondary-horizon-days 30]` (without `--server`, judge v1 from the operator's box). Before any lookup it reads when each seed's run of each arm started (`bounce.json`, `pivot-1.json`, or the `started_at` that `baseline.py` writes in each `run.json`) and refuses: a run started more than 48 h after its seed's `first_seen`, or outside [first listed, seal] (rule 1 is applied when `seeds` picks, and again here, because the arms can run days after the pick); a Bounce-CTI run that did not end `done`; a web run that timed out, errored or gave no parsable answer (its empty graph would seal as "found nothing"); and an arm that says no start time at all, unless `--allow-unstamped`, which the commitment lists. This writes `manifest.json`: every arm's claims and run starts, the judge's answer for each at T, the horizon, and the sha256 of each graph. It also writes `commitment.json`: the manifest's sha256 and counts, the window (first and last run start, the most hours a run started after its seed's first listing), no indicator value. **Copy `commitment.json` to `eval/prospective/<batch>/` and commit it the same day** (the batch directory itself lives outside the repo). Its commit date is the pre-registration: it proves the claims were fixed before the judge spoke. `check` and `score` refuse a manifest whose hash is not the committed one.
+4. **Judge after the horizon.** `check --batch <batch>` (with the same `--server` when it was sealed under judge v2: a batch is checked by the judge that sealed it) repeats every lookup and refuses before `due_at` (exit 3). `--early` runs it anyway, and every score from it is labelled provisional. `--secondary` waits for the secondary horizon instead. `score --batch <batch> --write` writes `results.json` and `results.md` (counts only), which join the commitment in `eval/prospective/<batch>/`. The manifest, the checks and the graphs stay out of the repo: a claim can name a victim.
+
+**Lookups leave the box.** `seal` and `check` send every claim to OTX as a query, as Bounce-CTI's own `otx` source does during a run. A claim that names a victim (a compromised site's URL, say) is disclosed to OTX that way: nothing is submitted, but the question is seen.
+
+**The pre-registration is the committed copy.** The batch's own `commitment.json` is written by whoever sealed the batch, so on its own it proves nothing. `check` and `score` also compare the manifest with `eval/prospective/<batch>/commitment.json` when the repo has it, and `results.md` says whether that copy was found.
+
+**Claims.** A claim is what an arm would hand a defender: the domain, ip, url and hash nodes that `backend.action_exports` would put in a blocklist or a detection rule, minus the seed. Leads, `unverified`/`refuted`/`unverifiable` nodes and defused nodes are left out, as the exports leave them out. The definition is imported, not copied, so it moves with the exports.
+
+**Judge v1 (`otx-pulses/1`)**: AlienVault OTX pulses, exact indicator match, keyless (`OTX_API_KEY` is sent when set, for the rate limit only). Each claim lands in one class:
+
+| Class | At T | At the check | Reads as |
+|---|---|---|---|
+| `known` | in a pulse | — | already public: the arm could have read it |
+| `ahead` | in no pulse | in a pulse | found before the feed had it |
+| `unconfirmed` | in no pulse | in no pulse | not shown wrong, not shown right |
+| `benign` | whitelisted (`validation` / `false_positive`) at either time | | shared infrastructure, the N2 failure mode |
+| `undetermined` | a lookup failed at either time, or OTX has no exact lookup for the value (an imphash) | | never counted as "in no pulse" |
+
+Two traps in the judge, both measured on 2026-10-25:
+- **OTX files a registrable domain under `domain` and a subdomain under `hostname`. Asked in the wrong section, it answers a clean zero.** `moonzonet.com` (case 2's C2) is in 46 pulses under `domain` and in none under `hostname`; `cdn.jsdelivr.net` is the other way round. Every domain is asked in both sections. Listed in either one means listed. "In no pulse" needs both sections to have answered.
+- **The keyless API answers 429 after about 60 calls in 3 minutes, and the block outlasts the burst.** After about 100 anonymous requests in 20 minutes it was still answering 429 a quarter of an hour later, with no `Retry-After` header. Lookups are paced at 3 s per request (`--pause`), retried four times, and a `Retry-After` header wins when there is one. A lookup that fails at T can never be redone at T, so **`seal` writes nothing when a lookup fails** (exit 4, `--max-failed N` to accept N failures): seal again later. For a real batch, set `OTX_API_KEY` (a free OTX account; the same variable the `otx` source reads).
+
+**Metrics, per arm.** The class counts. `ahead_share` = ahead / (ahead + unconfirmed): of the claims nobody had listed, the share the feed confirmed later. `pooled_recall` = ahead / the union of every arm's `ahead` claims on the same seed. This is pooling as in TREC: the pool is what the systems found, the feed judges it. Report counts next to every percentage, because a batch yields few `ahead` claims.
+
+**What it does not measure:**
+- A pulse confirms that the indicator is malicious, not that it belongs to the seed's cluster. Read each `ahead` claim before quoting it.
+- One community feed is a partial judge, so `unconfirmed` does not mean wrong. Judge v2 adds sections (below), and it will raise `ahead` more than any change to the tool: compare arms under the same judge on the same batch, never a batch judged v1 with one judged v2.
+- Recall is relative to what the arms found together, not to the whole infrastructure.
+- Bounce-CTI reads some of the same feeds during a run. That is what `known` counts, and `ahead` excludes it by construction.
+
+**Judge v2 (`otx+abusech/2`, added 2026-10-26)**: asked through the server, which holds the keys (`POST /api/admin/eval/judge`, `backend/eval_judge.py`), so a batch is not throttled by the keyless OTX limit. Sections by claim type: OTX (keyed; a domain under both `hostname` and `domain`), ThreatFox `search_ioc`, URLhaus (host for an ip or a domain, URL for a url), MalwareBazaar `get_info` (hashes). The rule is v1's: listed in any section is listed; "in no listing" needs every section that can express the value to have answered; a section that cannot (an imphash) is `n/a`; only OTX whitelists. Three things v2 adds, each one measured or required by the design below:
+- **Exact match.** ThreatFox searches by substring. On production's cache (2026-10-26), a domain search also returned other domains that contain it, and a bare IP returned `ip:port` entries next to URLs that contain the IP. A listing counts only when its indicator is the claim (for an ip, an `ip:port` on that host).
+- **Never the cache.** Every lookup goes out live (`urllib`). The sources' cache would answer a check with what it stored at T.
+- **A positive control.** A seed picked from ThreatFox is listed there by construction. If the judge's `threatfox` section does not list it at T, the section is blind (a renamed field, a changed match rule, a dead key) and every absence it reports is worthless: `seal` writes nothing (exit 4) and `preflight` says so before the arms run.
+- **A seed the search misses is read by its id (added 2026-10-27).** The first `preflight` on production (2026-10-27 00:15 UTC, a throwaway batch) refused 3 of 6 seeds picked from ThreatFox an hour earlier: `search_ioc` did not return them, although the entries just before and just after them were found (the three missing ones were created between 23:03 and 23:07 UTC; one seen entry was 90 seconds old). The search alone cannot say whether such an entry is gone, not returned yet, or asked under another form. So the control reads each seed the search did not return by its id (ThreatFox `{"query": "ioc", "id": N}`, the `entries` field of `POST /api/admin/eval/judge`), and searches its value back both ways (the default wildcard search, and `exact_match`):
+  - still in the feed, with the seed's value: **late**. Accepted at T, recorded in the manifest (`control_at_t`) and counted in the commitment (`seeds_late_at_t`), as long as the search returns at least one other seed of that feed (otherwise the search path itself is suspect: preflight again later);
+  - gone (`no_result`), holding another value, or unreadable (any other answer: this query's statuses are not documented, so none of them reads as "gone"): refused, nothing sealed. A seed its feed withdrew before T cannot be kept or swapped (that would be choosing): start another batch with `--avoid`.
+  - **At the check the control is strict.** Every seed must be returned by its feed's search: a present entry the search still misses a horizon later is a blind search, and `score` refuses that check (exit 4: check again later). A seed whose entry is gone by then is `withdrawn`: the feed retracted it after the seal, which `score` reports and does not hide.
+- **A listing dated before the seal is `known`, whatever the search said at T (added 2026-10-27).** A search that lags would otherwise turn the feed's own knowledge into `ahead`: a claim ThreatFox listed before T but did not return at T, found at the check, would read as found before the feed had it. Under judge v2, a claim the check finds in an abuse.ch entry (ThreatFox, URLhaus, MalwareBazaar) created before `sealed_at` is `known`, counted again as `known_late`. Not for OTX: an indicator can be added to a pulse created long before, so a pulse's date is not the indicator's (rule 3's negative delays).
+
+**Design rules written before the first batch (2026-10-26).** Each answers a way the number can lie; sources in the bracket.
+1. **A mechanical arm, `pivot-1`.** Sharing infrastructure with a known-bad seed already predicts maliciousness (Khalil, Yu and Guan, AsiaCCS 2016: over 95 % true positives at under 0.5 % false positives from passive DNS), so a one-hop pivot without a model is a strong baseline. `pivot-1` runs the seed type's mandatory tools on the seed alone, keeps everything they return through the same neutralisation as the exports, and runs in the same hour as the other arms: it cannot be rebuilt later (passive DNS and the judge move). What an agent adds is its `ahead` beyond `pivot-1`, and its `benign` fewer. The route is `POST /api/admin/eval/pivot` (`backend/pivot_arm.py`); `prospective.py pivot --batch <batch> --out <dir> --server … --cookies …` fills the arm under one timestamp, and `seal --arm pivot-1=<dir>` refuses it unless it was filled for these seeds within the hour before the seal. Every IP, domain, URL or hash in a tool's answer is a node, nothing judges them (no node is tagged malicious), and a failed tool is listed in `metadata.tools`. A batch's arms are fixed when it is sealed, so the first batch waits for the lot-1 run of this arm.
+2. **A secondary horizon, pre-registered.** The rare indicators two vendors share reach the second one about a month later on average (Bouwman et al., USENIX Security 2020). The primary horizon stays 14 days; every batch also seals a 30-day one (`secondary_due_at` in the commitment). Adding a horizon after seeing the results would be choosing the one that suits.
+3. **Who confirmed, and when.** Under judge v2, each listing keeps its id, creation date and author. `score` reports, per arm, the sections that confirmed each `ahead` claim; `ahead_independent`, the ones confirmed in another feed than the seed's by another author than the seed's reporter (a seed's reporter keeps submitting its cluster with its own pivots, and a judge that reads the same feed rewards arms that pivot like it); and the days from the seal to the first dated confirmation (all on day 1 reads as a mirror; spread out reads as analysts; a negative value is a listing dated before the seal that the judge did not show at T, such as an indicator added to an older pulse).
+4. **Ten to twelve seeds, in two batches analysed together.** The per-seed sign test cannot go below p = 2^(1−n): 0.0625 with 5 seeds, even if one arm wins on all of them, and a seed where no arm has an `ahead` claim drops out. Batches analysed together use the same judge, the same arms and disjoint families (`seeds --avoid`). Resample seeds, never claims: the claims of one seed are one cluster, not independent draws.
+5. **Nothing that makes its own confirmation.** A public submission (an urlscan scan, a URL sent to VirusTotal, an IOC submitted to a feed) can put a claim into a feed before the check, and the judge would count it `ahead`. `backend/tests/test_sources_read_only.py` checks that every source and the judge only read: every non-GET request goes to a listed lookup endpoint, abuse.ch queries are read verbs, no upload, no submission path, no GraphQL mutation. And no demo snapshot or share link of a prospective investigation before its check: a published page is a publication.
+
+References for the rules above: Khalil, Yu, Guan, "Discovering Malicious Domains through Passive DNS Data Graph Analysis", ASIA CCS 2016, doi:10.1145/2897845.2897877 (abstract: true positive rate over 95 %, false positive rate under 0.5 %). Bouwman, Griffioen, Egbers, Doerr, Klievink, van Eeten, "A different cup of TI? The added value of commercial threat intelligence", USENIX Security 2020, https://www.usenix.org/conference/usenixsecurity20/presentation/bouwman (shared indicators reach the second vendor "with a delay of, on average, a month"). Li et al., "Reading the Tea Leaves: A Comparative Analysis of Threat Intelligence", USENIX Security 2019 (over 97 % of the indicators of most feed categories appear in one feed only, which is why `unconfirmed` is not "wrong").
 
 ---
 
@@ -144,6 +237,9 @@ Every delta (missing node, missing edge, wrong pivot, noise inclusion) must be t
 | **F-DATA-DECAYED** | GT node absent from *every* live source response (seed decayed) | **Exogenous — NOT a tool failure.** Triggers REC SKIP (§3); refresh or retire the seed |
 | **F-SRC-TOKEN-DEAD** | Integrated source returns systemic auth failure (e.g. OpenCTI `AUTH_REQUIRED`) | **Ops action** (refresh token in `.env`), not a code bug; list under the run report's "ops actions" |
 | **F-OVER-ATTRIBUTION** | A negative/benign case (§9b) was clustered or attributed | Restraint failure; tighten defuse / require ≥ 2 corroborating markers for cluster edges |
+| **F-LEAD-UNRESOLVED** | Context-pool leads left `unverified` at end of run | The corroboration phase under-ran: check `phase_corroborate_leads` turn budget / that `verifiable_by` named a real tool |
+| **F-LEAD-LEAK** | A `lead` or unratified node reached an actionable export | **Critical.** The tier boundary failed — check `context_pool.is_actionable` wiring, not the prompt |
+| **F-LEAD-FALSE-CORROB** | A lead marked `corroborated` with evidence the tool did not actually return | **Critical.** Worse than a refuted lead: launders a guess into an exportable indicator |
 
 ---
 
@@ -191,8 +287,10 @@ A fix must not regress **CAP** on any case (LIVE or decayed). Before pushing to 
 | **Restraint floor** | Mean RST across defuse cases (4, 6, 11, 12) + negatives (§9b) | ≥ 80 |
 | **CAP regression** | Any case's CAP below its prior run | **None. Hard gate.** |
 | **REC (context only)** | NR/ER/MK/COV over LIVE cases | reported; **MK ≥ 50** on live primary cases. **No hard target** (data-dependent). |
+| **COR — Corroboration rate** | `corroborated / total_leads` over context-pool leads (`GET /api/investigations/{id}/leads`). Only scored when the context pool was mounted (`BOUNCE_CTX_ENABLED`, or `context_pool: true` on that investigation, which an admin run asks with `BOUNCE_EVAL_CONTEXT_POOL=1`, see `eval/README.md`); N/A otherwise. | reported per run/vertical/model. **Untested-lead rate ≤ 20%** (leaving leads at `unverified` is the failure mode, not refuting them). |
+| **Lead leakage** | Any `lead` node, or any node tagged `unverified`/`refuted`/`unverifiable`, appearing in a blocklist / detection rule / takedown bundle / STIX observable | **0. Hard gate.** |
 
-A commit fails the gate if: **any hallucination, any CAP regression, or the PS / restraint floor is breached.** **Recall decay never fails the gate** — isolating tool capability from data freshness is the entire point of v3. The pre-v3 "overall mean / pass rate" numbers are retained in historical scorecards for trend continuity but are superseded by CAP.
+A commit fails the gate if: **any hallucination, any CAP regression, any lead leakage, or the PS / restraint floor is breached.** **Recall decay never fails the gate** — isolating tool capability from data freshness is the entire point of v3. The pre-v3 "overall mean / pass rate" numbers are retained in historical scorecards for trend continuity but are superseded by CAP.
 
 ---
 
@@ -843,6 +941,23 @@ malicious; **0 if any threat-actor / malware / kit attribution is asserted.**
 `liveness_probe` is N/A for negatives (they are never gated). Add more N-series
 seeds as new false-positive classes appear in production triage.
 
+**2026-10-22, N2 at RST 0 and why.** On the 2026-10-21 bench (`claude-opus-5`)
+the main and followup phases concluded `legitimate` / `benign` at 31 nodes,
+which `score_negative` scores 100. The autonomous pivot drain then ran
+`urlhaus_host` on the CDN and graphed an ACRStealer / ClearFake cluster from
+its abuse URLs (65 nodes, 8 infra nodes tagged malicious, 3 kit/family nodes):
+RST 0. Read that way, the failure is the drain's, not the investigation's: the
+seed lineage itself stayed `cdn` / `benign` throughout. Fix: a CTI seed the run
+itself concluded legitimate is no longer drained (`agent_runner._concluded_benign`).
+Replayed on the production event log with `eval/drain_gate_replay.py` (graph
+rebuilt as it stood at each drain start, 169 drains): 19 skipped, all benign
+seeds, N1-N3 among them, 2 of which had added malicious nodes; 0 kept drains on
+a `legitimate` hypothesis add any; the five positive cases of that bench still
+drain. A live N2 run on a local instance
+(`claude-sonnet-5-5`, no source API keys) concluded benign and logged
+`phase_pivot_drain_skipped`; a bench re-run of the negatives on the production
+instance is still to do.
+
 ---
 
 ## 10. Known gaps
@@ -858,6 +973,8 @@ Carried forward from the research phase, reviewed for V2.
 - **Two Cloudflare-defuse cases with overlapping signal** — Cases 11 and 12 both test Cloudflare fronting, but exercise different mechanics (historical-origin-IP pivot vs cert-CN pivot). Keep both; they fail independently. If one had to be dropped for time, Case 12 (classic) has higher pedagogical value; Case 11 has higher freshness.
 
 - **Case 11 seed must be refreshed per run** — Smishing Triad domains burn in < 30 days. Pre-run selection procedure in §3.
+
+- **The cases favour a model with web search** (found 2026-10-21, §4.D) — every positive case's ground truth comes from a public write-up, so a bare model with WebSearch can read it (it fetched its case's own write-up on 3 of 5). Measuring what the tool adds over search needs cases whose ground truth is infrastructure no write-up lists (siblings found by pivoting after the report, or seeds from a private feed scored by hand).
 
 - **Candidates explicitly cut** — APT28 Nearest Neighbor (LOTL, no pivotable infra); APT28 Car-for-Sale (legit-service noise); Latrodectus (private NetFlow); ClearFake EtherHiding (on-chain, out of scope); Rockstar 2FA (overlaps Case 9); VexTrio Viper (private Infoblox telemetry); LabHost (2 years old); generic AiTM kits (no clean passive chain); crypto drainer infra (on-chain).
 
@@ -884,6 +1001,11 @@ Carried forward from the research phase, reviewed for V2.
   the old "overall mean" tracked data freshness as much as tool quality. No
   positive-case ground truth changed. The runnable nightly routine is
   `eval/NIGHTLY_PROMPT.md`.
+- **v3.1** (2026-10-21) — **Bare-model baseline** (§4.D): the same model without
+  Bounce-CTI, in a no-tool arm and a web-search arm, scored by the same scorer
+  on recall only. `scorer.score_case` / `score_negative` take an optional
+  directory so any run can be scored, not only `/tmp/eval_run`. No case or
+  rubric changed.
 
 ---
 

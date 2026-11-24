@@ -1,10 +1,16 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import Icon from './components/Icon.jsx'
+import { pressable } from './lib/pressable.js'
 
 const MODEL_LABELS = {
-  sonnet: 'Sonnet 4.6',
-  opus: 'Opus 4.6',
+  sonnet: 'Sonnet (current: 5.5)',
+  opus: 'Opus (current: 5)',
+  haiku: 'Haiku (current: 5.5)',
+  'sonnet-5': 'Sonnet 5',
+  'opus-5': 'Opus 5',
+  'fable-5': 'Fable 5',
+  'opus-4.8': 'Opus 4.8',
   'opus-4.7': 'Opus 4.7',
-  haiku: 'Haiku 4.5',
 }
 
 function fmtDate(ts) {
@@ -142,7 +148,7 @@ export default function AdminPanel({ onClose, selfId, onImpersonate }) {
       <div className="admin-modal" onClick={e => e.stopPropagation()}>
         <div className="admin-header">
           <h2>Admin · Users</h2>
-          <button className="admin-close" onClick={onClose}>✕</button>
+          <button className="admin-close" onClick={onClose} aria-label="Close" title="Close"><Icon name="close" solo /></button>
         </div>
 
         {err && <div className="auth-error" style={{ margin: '0 0 12px' }}>{err}</div>}
@@ -192,7 +198,7 @@ export default function AdminPanel({ onClose, selfId, onImpersonate }) {
                   </label>
                 ))}
               </div>
-              <button className="auth-btn" disabled={busy} onClick={createUser}>Create user & generate PIN</button>
+              <button className="auth-btn" disabled={busy} onClick={createUser}><Icon name="plus" />Create user & generate PIN</button>
             </div>
           )}
         </div>
@@ -247,7 +253,7 @@ function UserRow({ user, selfId, allModels, expanded, onToggle, onDelete, onImpe
 
   return (
     <div className={`admin-user ${expanded ? 'expanded' : ''}`}>
-      <div className="admin-user-row" onClick={onToggle}>
+      <div className="admin-user-row" aria-expanded={expanded} {...pressable(onToggle)}>
         <div className="admin-user-main">
           <span className="admin-user-id">#{user.id}</span>
           {user.label && <span className="admin-user-label">{user.label}</span>}
@@ -361,7 +367,7 @@ function UserRow({ user, selfId, allModels, expanded, onToggle, onDelete, onImpe
           {user.id !== selfId && !user.is_admin && (
             <div className="admin-subsection admin-danger">
               <button className="auth-btn danger" disabled={busy} onClick={onDelete}>
-                Delete user and all their data
+                <Icon name="trash" />Delete user and all their data
               </button>
             </div>
           )}
@@ -403,7 +409,7 @@ function LessonsLearnedSection() {
   return (
     <div className="admin-section">
       <div className="admin-section-title" style={{ cursor: 'pointer' }}
-           onClick={() => setOpen(o => !o)}>
+           aria-expanded={open} {...pressable(() => setOpen(o => !o))}>
         {open ? '▾' : '▸'} Lessons learned (agent feedback)
         {entries !== null && <span style={{ opacity: 0.6, marginLeft: 6, fontWeight: 400 }}>· {total} total</span>}
       </div>
@@ -439,7 +445,7 @@ function LessonsEntry({ entry }) {
   ].filter(Boolean).join(' · ') || 'no items'
   return (
     <div className="lessons-entry">
-      <div className="lessons-header" onClick={() => setExpanded(x => !x)}>
+      <div className="lessons-header" aria-expanded={expanded} {...pressable(() => setExpanded(x => !x))}>
         <span className="lessons-seed">
           <span className="lessons-type">{entry.seed_type}</span>{' '}
           <span className="lessons-value">{entry.seed_value}</span>

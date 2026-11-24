@@ -10,7 +10,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, Response, Cookie, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, Response, Cookie, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -18,11 +18,14 @@ from typing import Optional
 
 from . import graph_store as gs
 from . import auth
+from . import demo_snapshot
+from . import run_progress
 from . import seeds
 from . import verticals
 from .agent_runner import (
     run_investigation, run_pivot, run_add_seed, run_custom_prompt,
     stop_investigation, resume_investigation, quota_block_active,
+    reset_fixture_capture, stop_count, mark_stopped_by_user,
 )
 from .refang import refang
 
@@ -31,7 +34,19 @@ app = FastAPI(title="Bounce-CTI")
 app.add_middleware(CORSMiddleware, allow_origins=[], allow_methods=["*"], allow_headers=["*"])
 
 
-ALLOWED_MODELS = ["sonnet", "opus", "opus-4.7", "opus-4.8", "haiku"]
+# Model aliases an analyst can pick. Every entry maps to an exact model id in
+# agent_runner._MODEL_ALIASES. The bare tier names ("sonnet"/"opus"/"haiku")
+# are the current model of their tier, pinned there to the newest one the
+# production claude CLI can run (the CLI's own aliasing followed its age, not
+# the label); the versioned entries never move.
+# "fable-5" (Claude Fable 5, the top capability tier) ships safety classifiers
+# aimed at offensive-cyber content — malware-heavy investigations may hit
+# refusals on it, so prefer "opus-5" when that matters.
+ALLOWED_MODELS = [
+    "sonnet", "opus", "haiku",        # current of each tier (pinned, moves with the code)
+    "sonnet-5", "opus-5", "fable-5",  # Claude 5 family (pinned)
+    "opus-4.8", "opus-4.7",           # previous Opus generations (pinned)
+]
 DEFAULT_MODEL = "opus"
 
 # Extended-thinking effort levels accepted by the Claude CLI (`--effort` /
@@ -40,6 +55,11 @@ DEFAULT_MODEL = "opus"
 ALLOWED_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 SESSION_COOKIE = "session"
+# D3 subdomain routing: when the app is served on cti./osint./dd. deep-link
+# subdomains, set this to the registrable parent (e.g. ".alexandre-pinoteau.fr")
+# so the session cookie is shared across them — one login, all verticals. Unset
+# (default) keeps the cookie host-only (single-host deploys, dev).
+COOKIE_DOMAIN = os.getenv("BOUNCE_COOKIE_DOMAIN") or None
 
 
 def _check_effort(effort: Optional[str]) -> Optional[str]:
@@ -65,6 +85,14 @@ def _bootstrap():
             print(f"[startup] reconciled {n} orphaned 'running' investigation(s)")
     except Exception as e:
         print(f"[startup] orphan reconciliation failed: {e}")
+    # ALV-1773: cache rows written before http_client.cache_params kept an API key
+    # in their key. Purge them; log the count only, never a key (it holds the secret).
+    try:
+        n = gs.purge_secret_cache_keys()
+        if n:
+            print(f"[startup] purged {n} cache row(s) whose key held an auth parameter")
+    except Exception as e:
+        print(f"[startup] cache secret purge failed: {type(e).__name__}")
 
 
 # ── Live WebSocket registry (for shutdown broadcast) ───────────────────────
@@ -165,6 +193,7 @@ def _set_session_cookie(response: Response, token: str):
         secure=True,
         samesite="lax",
         path="/",
+        domain=COOKIE_DOMAIN,
     )
 
 
@@ -189,7 +218,7 @@ def auth_login(req: LoginReq, request: Request, response: Response):
 @app.post("/api/auth/logout")
 def auth_logout(response: Response, session: Optional[str] = Cookie(default=None)):
     auth.destroy_session(session)
-    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(SESSION_COOKIE, path="/", domain=COOKIE_DOMAIN)
     return {"ok": True}
 
 
@@ -261,6 +290,27 @@ def admin_delete_user(target_id: int, admin_id: int = Depends(current_admin)):
     return {"ok": True}
 
 
+@app.post("/api/admin/users/{target_id}/rotate_pin")
+def admin_rotate_pin(target_id: int, _: int = Depends(current_admin)):
+    """Give an existing user a new PIN, keeping their investigations.
+
+    The leak case: a PIN ends up in a doc, a screenshot or a public repo.
+    Deleting the user would work but cascades away everything they own, so
+    rotating is the non-destructive fix. Admins are excluded: their PIN comes
+    from BOUNCE_ADMIN_PIN, and bootstrap_admin() would re-create a second admin
+    from the old value on the next restart."""
+    target = auth.get_user(target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="user not found")
+    if target["is_admin"]:
+        raise HTTPException(
+            status_code=400,
+            detail="admin PIN is set by BOUNCE_ADMIN_PIN; change it there and restart",
+        )
+    pin = auth.rotate_pin(target_id)
+    return {"id": target_id, "pin": pin}
+
+
 @app.post("/api/admin/impersonate/{target_id}")
 def admin_impersonate(target_id: int, response: Response, admin_id: int = Depends(current_admin)):
     target = auth.get_user(target_id)
@@ -304,7 +354,91 @@ def admin_lessons_learned(limit: int = 200, _: int = Depends(current_admin)):
     return {"entries": entries, "total": len(lines)}
 
 
+# ── Prospective eval, server side (EVAL_PROTOCOL §4.E, backend/eval_judge.py) ──
+# The feed keys live in this server's .env; these two routes are how
+# eval/prospective.py uses them without ever reading them.
+def _abusech_key_or_503() -> str:
+    from . import config
+    if not config.ABUSECH_KEY:
+        raise HTTPException(status_code=503, detail="ABUSECH_AUTH_KEY is not set on this server")
+    return config.ABUSECH_KEY
+
+
+@app.get("/api/admin/eval/fresh_iocs")
+def admin_eval_fresh_iocs(days: int = 2, _: int = Depends(current_admin)):
+    """ThreatFox's last ``days`` (1-7) of indicators as candidate prospective
+    seeds, each with ``excluded_by``: the §4.E rules it breaks (empty =
+    eligible). Fetched live, never from the cache. 502 when ThreatFox fails."""
+    from . import eval_judge
+    try:
+        return eval_judge.fresh_iocs(abusech_key=_abusech_key_or_503(), days=days)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+class EvalPivotReq(BaseModel):
+    type: str
+    value: str
+
+
+@app.post("/api/admin/eval/pivot")
+async def admin_eval_pivot(req: EvalPivotReq, _: int = Depends(current_admin)):
+    """The mechanical ``pivot-1`` arm for one seed: the mandatory tools of its
+    type run on the seed alone, NO model, what comes back kept as nodes after the
+    exports' own neutralisation. Answers a ``graph.json`` (``nodes``, ``edges``,
+    ``metadata.tools`` = one status per tool: a failed tool is shown, not empty)."""
+    from . import pivot_arm, seeds
+    if req.type not in seeds.KNOWN_SEED_TYPES or not seeds.mandatory_tools(req.type, req.value):
+        raise HTTPException(status_code=422, detail=f"no mandatory tools for seed type {req.type!r}")
+    if not req.value.strip() or len(req.value) > 2048:
+        raise HTTPException(status_code=422, detail="bad seed value")
+    return await pivot_arm.run(req.type, req.value)
+
+
+class EvalClaim(BaseModel):
+    type: str
+    value: str
+
+
+class EvalJudgeReq(BaseModel):
+    claims: list[EvalClaim]
+    # Seed sources (``threatfox:<id>``) to read by id: the positive control's
+    # second question when the search does not return a seed.
+    entries: list[str] = []
+
+
+@app.post("/api/admin/eval/judge")
+def admin_eval_judge(req: EvalJudgeReq, _: int = Depends(current_admin)):
+    """Judge v2 (``otx+abusech/2``) on up to 20 claims: OTX (with this server's
+    key) + ThreatFox + URLhaus + MalwareBazaar, live, exact match, with each
+    listing's id, creation date and author. Answers ``{judge, lookups}``,
+    keyed ``type|value``. A failed section leaves a claim in error, never
+    "in no listing". With ``entries`` (up to 20 ``threatfox:<id>``), also
+    ``entries``: each one read by its id and searched back by its value."""
+    from . import config, eval_judge
+    if len(req.claims) > eval_judge.MAX_CLAIMS_PER_REQUEST:
+        raise HTTPException(status_code=422,
+                            detail=f"at most {eval_judge.MAX_CLAIMS_PER_REQUEST} claims per request")
+    if len(req.entries) > eval_judge.MAX_ENTRIES_PER_REQUEST:
+        raise HTTPException(status_code=422,
+                            detail=f"at most {eval_judge.MAX_ENTRIES_PER_REQUEST} entries per request")
+    key = _abusech_key_or_503()
+    doc = eval_judge.judge([c.model_dump() for c in req.claims],
+                           otx_key=config.OTX_KEY or None, abusech_key=key)
+    if req.entries:
+        doc["entries"] = eval_judge.entries(req.entries, abusech_key=key)
+    return doc
+
+
 # ── Core routes (all scoped to user_id) ────────────────────────────────────
+def _chain_stopped(inv_id: str, stops_at_start: int) -> bool:
+    """Several routes chain runs on one investigation: the first seed, then one
+    add-seed run per other seed. A user stop ends the run in flight
+    (agent_runner) and, through this check before each next seed, the chain.
+    `stops_at_start` is `stop_count(inv_id)` read when the chain was created."""
+    return stop_count(inv_id) != stops_at_start
+
+
 def _require_owner(inv_id: str, user_id: int):
     owner = gs.get_investigation_owner(inv_id)
     # owner may be None for legacy investigations; only the user's own ones are accessible
@@ -453,6 +587,43 @@ class StartReq(BaseModel):
     model: str = "opus"
     effort: Optional[str] = None
     vertical: str = "cti"
+    # Record every source response this investigation reads into
+    # data/fixtures/capture/<id>/ (EVAL_PROTOCOL §4.C). Admin only.
+    capture: bool = False
+    # Mount the context pool (model memory + wrapped open web, as capped leads)
+    # for this one investigation, whatever the vertical's .env policy. Admin
+    # only: it is how an eval run measures CTI with the pool on.
+    context_pool: bool = False
+
+
+def _check_context_pool(user_id: int, requested: bool) -> bool:
+    """The context pool changes what the agent can reach (the open web) and what
+    it spends (BOUNCE_CTX_BUDGET calls), so only an admin may force it on. A
+    request the server cannot honour is refused loudly, never downgraded: an
+    eval run that asked for the pool must not get a run without it. 403 for a
+    non-admin, 409 when the kill switch BOUNCE_CTX_ENABLED=0 is set."""
+    if not requested:
+        return False
+    u = auth.get_user(user_id)
+    if not u or not u["is_admin"]:
+        raise HTTPException(status_code=403, detail="context_pool requires an admin session")
+    from . import context_pool
+    if not context_pool.context_pool_enabled("cti", forced=True):
+        raise HTTPException(status_code=409,
+                            detail="context pool disabled on this server (BOUNCE_CTX_ENABLED=0)")
+    return True
+
+
+def _check_capture(user_id: int, requested: bool) -> bool:
+    """Fixture capture writes the investigation's source responses to the
+    server's disk, so only an admin may ask for it. Refused loudly (403): a
+    caller that asked for a capture must never get a run without one."""
+    if not requested:
+        return False
+    u = auth.get_user(user_id)
+    if not u or not u["is_admin"]:
+        raise HTTPException(status_code=403, detail="capture requires an admin session")
+    return True
 
 
 @app.post("/api/investigations")
@@ -460,6 +631,8 @@ async def start(req: StartReq, user_id: int = Depends(current_user)):
     _require_quota_available()
     model = _check_model(user_id, req.model)
     effort = _check_effort(req.effort)
+    capture = _check_capture(user_id, req.capture)
+    ctx_forced = _check_context_pool(user_id, req.context_pool)
     vertical = verticals.normalise(req.vertical)
     seed_type = req.seed_type
     if seed_type == "auto":
@@ -470,9 +643,18 @@ async def start(req: StartReq, user_id: int = Depends(current_user)):
     if not sv:
         raise HTTPException(status_code=400, detail="seed_value required")
     inv_id = gs.create_investigation(seed_type, sv, user_id=user_id, model=model,
-                                     effort=effort, vertical=vertical)
+                                     effort=effort, vertical=vertical,
+                                     fixture_capture=capture,
+                                     context_pool=ctx_forced)
     asyncio.create_task(run_investigation(inv_id, seed_type, sv, model=model))
-    return {"id": inv_id, "seed_type": seed_type, "vertical": vertical}
+    from . import context_pool
+    ctx_on = context_pool.context_pool_enabled(vertical, forced=ctx_forced)
+    return {"id": inv_id, "seed_type": seed_type, "vertical": vertical,
+            "fixture_capture": capture,
+            # What the agent of this investigation will actually mount: the
+            # eval runner checks both before it lets a "with web" run spend.
+            "context_pool": ctx_on,
+            "context_pool_web": ctx_on and context_pool.web_tools_enabled()}
 
 
 class BatchItem(BaseModel):
@@ -535,10 +717,13 @@ async def start_batch(req: BatchStartReq, user_id: int = Depends(current_user)):
             gs.add_node(inv_id, _st, _sv, metadata={}, source="batch",
                         tags=["seed", "pending_seed"])
 
-        async def _combined_chain(_iid=inv_id, _primary=(st0, sv0), _extras=extra_seeds):
+        async def _combined_chain(_iid=inv_id, _primary=(st0, sv0), _extras=extra_seeds,
+                                  _stops=stop_count(inv_id)):
             import json as _json, time as _time
             await run_investigation(_iid, _primary[0], _primary[1], model=model)
             for _st, _sv in _extras:
+                if _chain_stopped(_iid, _stops):
+                    return
                 gs.set_status(_iid, "running")
                 # Clear the pending_seed marker now that this seed is being
                 # actively investigated. The node was pre-registered above so
@@ -682,6 +867,24 @@ def transcript(inv_id: str, user_id: int = Depends(current_user)):
     return {"investigation_id": inv_id, "entries": out}
 
 
+@app.get("/api/investigations/{inv_id}/progress")
+def investigation_progress(inv_id: str, user_id: int = Depends(current_user)):
+    """Where the investigation's current run stands (backend/run_progress.py).
+
+    The run is everything logged since the last `agent_starting` event. Returns
+    its kind and start, the phase in flight (null between phases and once the
+    run is over), the phases already finished, the source calls counted the way
+    the pivot-drain loop counts them, and that loop's budget (`ceiling`, null
+    for a run with no drain loop). Read-only and small: the UI polls it while
+    the investigation runs.
+    """
+    _require_owner(inv_id, user_id)
+    doc = run_progress.read_progress(inv_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return doc
+
+
 @app.get("/api/quota")
 def get_quota(user_id: int = Depends(current_user)):
     """Report the Claude-subscription quota state for the host account.
@@ -724,15 +927,19 @@ async def resume_inv(inv_id: str, user_id: int = Depends(current_user)):
 
 @app.post("/api/investigations/{inv_id}/stop")
 def stop_inv(inv_id: str, user_id: int = Depends(current_user)):
+    """Stop the run of an investigation: the phase in flight is killed and no
+    later phase starts (agent_runner.stop_investigation). `killed` says whether
+    a process was killed; a stop that lands between two phases kills none and
+    still ends the run, so the status is written for any investigation that
+    was `running`. The graph and the events are kept; resume and rerun work
+    afterwards."""
     _require_owner(inv_id, user_id)
+    with gs.conn() as c:
+        row = c.execute("SELECT status FROM investigations WHERE id=?", (inv_id,)).fetchone()
+    was_running = bool(row) and row["status"] == "running"
     killed = stop_investigation(inv_id)
-    if killed:
-        gs.set_status(inv_id, "done")
-        import json as _json, time as _time
-        with gs.conn() as c:
-            payload = {"kind": "status_change", "status": "done", "stopped_by_user": True}
-            c.execute("INSERT INTO events(investigation_id, kind, payload, created_at) VALUES (?,?,?,?)",
-                      (inv_id, "status_change", _json.dumps(payload), _time.time()))
+    if killed or was_running:
+        mark_stopped_by_user(inv_id)
     return {"ok": True, "killed": killed}
 
 
@@ -741,6 +948,7 @@ def delete_inv(inv_id: str, user_id: int = Depends(current_user)):
     _require_owner(inv_id, user_id)
     stop_investigation(inv_id)  # kill agent if running before deleting
     gs.delete_investigation(inv_id)
+    reset_fixture_capture(inv_id)  # its capture would be left with no owner
     return {"ok": True}
 
 
@@ -821,6 +1029,8 @@ async def rerun(inv_id: str, req: RerunReq = RerunReq(), user_id: int = Depends(
     # applies the new choice to every phase of the fresh run.
     gs.set_effort(inv_id, _check_effort(req.effort))
     gs.clear_investigation(inv_id)
+    # The previous run's capture goes with its graph: a fixture set holds one run.
+    reset_fixture_capture(inv_id)
     with gs.conn() as c:
         c.execute("UPDATE investigations SET status='running' WHERE id=?", (inv_id,))
     asyncio.create_task(run_investigation(inv_id, row["seed_type"], row["seed_value"], model=model))
@@ -1091,6 +1301,44 @@ def export_kyb_dossier(inv_id: str, user_id: int = Depends(current_user)):
             "filename": f"bounce-kyb-{inv_id}.dossier.md"}
 
 
+@app.get("/api/investigations/{inv_id}/leads")
+def investigation_leads(inv_id: str, user_id: int = Depends(current_user)):
+    """Context-pool leads + corroboration telemetry for the investigation.
+
+    Leads are claims sourced from the agent's prior knowledge or from open-web
+    text rather than from a source tool (see backend/context_pool.py). They are
+    capped at confidence 0.35, excluded from every actionable export, and only
+    become findings once a primary source tool ratifies them.
+
+    ``corroboration_rate`` is the measurable hallucination thermometer for a run:
+    how much of what the model proposed actually survived contact with a source."""
+    _require_owner(inv_id, user_id)
+    from . import context_pool
+    leads = gs.list_nodes_of_type(inv_id, context_pool.LEAD_NODE_TYPE)
+    stats = context_pool.corroboration_stats(leads)
+    vertical = gs.get_vertical(inv_id)
+    return {
+        **stats,
+        "vertical": vertical,
+        "context_pool_enabled": context_pool.context_pool_enabled(
+            vertical, forced=gs.get_context_pool(inv_id)),
+        "ctx_calls_used": gs.get_counter(inv_id, "ctx_calls"),
+        "ctx_budget": context_pool.ctx_budget(),
+        "leads": [
+            {"id": n["id"], "claim": n["value"], "confidence": n.get("confidence"),
+             "source": n.get("source"), "tags": n.get("tags") or [],
+             "subject": (n.get("metadata") or {}).get("subject"),
+             "claim_type": (n.get("metadata") or {}).get("claim_type"),
+             "verifiable_by": (n.get("metadata") or {}).get("verifiable_by"),
+             "falsifier": (n.get("metadata") or {}).get("falsifier"),
+             "evidence_tool": (n.get("metadata") or {}).get("verdict_evidence_tool"),
+             "evidence_value": (n.get("metadata") or {}).get("verdict_evidence_value"),
+             "note": (n.get("metadata") or {}).get("verdict_note")}
+            for n in leads
+        ],
+    }
+
+
 @app.get("/api/investigations/{inv_id}/nodes/{node_id}/evidence")
 def node_evidence(inv_id: str, node_id: str, user_id: int = Depends(current_user)):
     """Return raw cached CTI source data relevant to a node.
@@ -1205,6 +1453,8 @@ async def from_pdf(
         "uploaded_at": time.time(),
     })
 
+    stops = stop_count(inv_id)  # read here, in the request: see _chain_stopped
+
     async def _chain():
         import json as _json
         # First pass gets the full report text so the agent encodes the
@@ -1216,6 +1466,8 @@ async def from_pdf(
             report_context=text,
         )
         for it in extras:
+            if _chain_stopped(inv_id, stops):
+                return
             gs.set_status(inv_id, "running")
             with gs.conn() as c:
                 payload = {"kind": "status_change", "status": "running",
@@ -1259,9 +1511,13 @@ async def add_pdf_seeds(
         "uploaded_at": time.time(),
     })
 
+    stops = stop_count(inv_id)  # read here, in the request: see _chain_stopped
+
     async def _chain():
         import json as _json
         for it in seeds:
+            if _chain_stopped(inv_id, stops):
+                return
             gs.set_status(inv_id, "running")
             with gs.conn() as c:
                 payload = {"kind": "status_change", "status": "running",
@@ -1362,6 +1618,8 @@ async def from_sample(
         "uploaded_at": time.time(),
     })
 
+    stops = stop_count(inv_id)  # read here, in the request: see _chain_stopped
+
     async def _chain():
         import json as _json
         await run_investigation(
@@ -1369,6 +1627,8 @@ async def from_sample(
             report_context=report_text or "",
         )
         for it in extras:
+            if _chain_stopped(inv_id, stops):
+                return
             gs.set_status(inv_id, "running")
             with gs.conn() as c:
                 payload = {"kind": "status_change", "status": "running",
@@ -1437,6 +1697,40 @@ def revoke_share(token: str, user_id: int = Depends(current_user)):
     if not ok:
         raise HTTPException(status_code=404, detail="not found")
     return {"ok": True}
+
+
+@app.get("/api/investigations/{inv_id}/demo_snapshot")
+def get_demo_snapshot(inv_id: str, label: Optional[str] = None,
+                      forbid: Optional[list[str]] = Query(default=None),
+                      user_id: int = Depends(current_user)):
+    """The investigation frozen as a static demo snapshot (backend/demo_snapshot.py):
+    what a share link with graph + report + timeline shows, minus agent
+    session ids, token usage and local paths. Owner only, like a share link.
+
+    Checked against the server's own secrets (its .env and environment) and
+    the `forbid` words: a hit answers 422 with the problems, which name a
+    secret but never print it. 200 → {snapshot, warnings, checked_secrets};
+    save `.snapshot` as eval/demo/<name>.json."""
+    _require_owner(inv_id, user_id)
+    view = gs.share_view(inv_id, demo_snapshot.SECTIONS)
+    if view is None:
+        raise HTTPException(status_code=404, detail="not found")
+    snap = demo_snapshot.from_view(view, gs.get_investigation_model(inv_id), label)
+    dotenv = Path(__file__).resolve().parent.parent / ".env"
+    # A .env that exists but can't be read would leave its secrets unchecked
+    # (eval/demo_export.py refuses the same case). No .env at all is fine: the
+    # secrets are then all in the environment, which is checked.
+    if dotenv.exists():
+        try:
+            dotenv.read_bytes()
+        except OSError:
+            raise HTTPException(status_code=503, detail="cannot read the server .env to check for secrets")
+    secrets = demo_snapshot.known_secrets(dotenv)
+    problems, warnings = demo_snapshot.check(demo_snapshot.serialise(snap), secrets, forbid)
+    if problems:
+        raise HTTPException(status_code=422, detail={"problems": problems, "warnings": warnings})
+    return {"snapshot": snap, "warnings": warnings,
+            "checked_secrets": len({v for _, v in secrets})}
 
 
 @app.get("/api/share/{token}")

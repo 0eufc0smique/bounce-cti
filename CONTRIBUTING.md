@@ -3,18 +3,18 @@
 Thanks for your interest in improving Bounce-CTI! This guide covers how to
 contribute and the few rules that keep the project safe to deploy.
 
-> **License note.** Bounce-CTI is **source-available**, not OSI open-source
-> (see [LICENSE](./LICENSE) and [COMMERCIAL.md](./COMMERCIAL.md)). Contributions
-> are welcome, but before your first contribution can be merged you must sign
-> the **[Contributor License Agreement](./CLA.md)** — this is what lets the
-> project reuse your work across all its distributions. See "CLA" below.
+> **License note.** Bounce-CTI is licensed under the **Apache License 2.0**
+> (see [LICENSE](./LICENSE)). Contributions are welcome and enter the Project
+> under that same license (inbound = outbound), as section 5 of Apache-2.0
+> provides. There is no CLA to sign.
 
-## CLA — required before your first merge
+## No CLA
 
-We use **CLA-Assistant**. On your first pull request, a bot comments with a
-link to sign the [CLA](./CLA.md). Sign once and it covers all your future PRs.
-**A PR cannot be merged until the CLA check is green.** If you contribute on
-behalf of an employer, make sure you're authorized to sign.
+The project used a Contributor License Agreement until November 2026. Since the
+move to Apache-2.0 it gave the maintainer no right beyond the license itself, so it was
+retired: by opening a pull request you submit your contribution under
+Apache-2.0 (section 5 of the license). Only submit work that is yours to give.
+[CLA.md](./CLA.md) keeps the record of contributions accepted under it.
 
 ## Before you start
 
@@ -64,11 +64,10 @@ full architecture, conventions, and project layout.
 5. **Don't include third-party code without flagging it.** If you copy or adapt
    code/data from another project, note its source and license in your PR so it
    can be tracked in `THIRD_PARTY_LICENSES` / `NOTICE`. Avoid copyleft
-   (GPL/AGPL) code — see [CLA.md](./CLA.md) §4.
+   (GPL/AGPL) code, which cannot be combined with an Apache-2.0 distribution.
 
 ## Pull-request checklist
 
-- [ ] CLA signed (the bot check is green).
 - [ ] `import backend.main` succeeds, `pytest backend/tests` passes, and `npm run build` succeeds.
 - [ ] No secrets in the diff.
 - [ ] Docs updated in the same commit (if applicable).
@@ -77,7 +76,9 @@ full architecture, conventions, and project layout.
 
 ## Reporting security issues
 
-Please do **not** open a public issue for security vulnerabilities. Email
-**alexandre.pinoteau@protonmail.com** directly.
+Please do **not** open a public issue for security vulnerabilities. Use GitHub's
+private vulnerability reporting (the repository's Security tab, "Report a
+vulnerability"), or open an issue asking for a private channel without giving
+details.
 
-Thanks for contributing! — Alexandre
+Thanks for contributing!

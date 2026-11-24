@@ -7,6 +7,7 @@ import hashlib
 from collections import Counter
 from contextlib import contextmanager
 from typing import Any, Optional
+from . import evidence_match, fixtures
 from .config import DB_PATH
 
 # Tags that indicate infrastructure owned/operated by a third party (CDN,
@@ -30,7 +31,9 @@ CREATE TABLE IF NOT EXISTS investigations (
     model TEXT,
     effort TEXT,
     title TEXT,
-    vertical TEXT DEFAULT 'cti'
+    vertical TEXT DEFAULT 'cti',
+    fixture_capture INTEGER NOT NULL DEFAULT 0,
+    context_pool INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
@@ -191,6 +194,15 @@ def init_db():
         # (cti / osint / dd). Defaults to 'cti' so pre-existing rows and any
         # caller that doesn't specify one stay on the original CTI behaviour.
         _ensure_column(c, "investigations", "vertical", "vertical TEXT DEFAULT 'cti'")
+        # Per-investigation fixture capture (EVAL_PROTOCOL §4.C), asked by an
+        # admin at creation. 0 for every pre-existing row.
+        _ensure_column(c, "investigations", "fixture_capture",
+                       "fixture_capture INTEGER NOT NULL DEFAULT 0")
+        # Per-investigation context pool (backend/context_pool.py), forced on by
+        # an admin at creation so an eval run can measure CTI with it. 0 = the
+        # .env policy decides, as for every pre-existing row.
+        _ensure_column(c, "investigations", "context_pool",
+                       "context_pool INTEGER NOT NULL DEFAULT 0")
         # users table may pre-date is_admin/allowed_models
         if c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").fetchone():
             _ensure_column(c, "users", "is_admin", "is_admin INTEGER NOT NULL DEFAULT 0")
@@ -201,14 +213,36 @@ def init_db():
 
 def create_investigation(seed_type: str, seed_value: str, user_id: Optional[int] = None,
                          model: Optional[str] = None, effort: Optional[str] = None,
-                         vertical: str = "cti") -> str:
+                         vertical: str = "cti", fixture_capture: bool = False,
+                         context_pool: bool = False) -> str:
     inv_id = hashlib.sha1(f"{time.time()}|{seed_type}|{seed_value}".encode()).hexdigest()[:12]
     with conn() as c:
         c.execute(
-            "INSERT INTO investigations(id, seed_type, seed_value, created_at, status, user_id, model, effort, vertical) VALUES (?,?,?,?,?,?,?,?,?)",
-            (inv_id, seed_type, seed_value, time.time(), "running", user_id, model, effort, vertical or "cti"),
+            "INSERT INTO investigations(id, seed_type, seed_value, created_at, status, user_id, model, effort, vertical, fixture_capture, context_pool) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (inv_id, seed_type, seed_value, time.time(), "running", user_id, model, effort, vertical or "cti",
+             1 if fixture_capture else 0, 1 if context_pool else 0),
         )
     return inv_id
+
+
+def get_context_pool(inv_id: str) -> bool:
+    """True when this investigation was created with the context pool forced on
+    (``POST /api/investigations`` with ``context_pool: true``, admin only). Read
+    by ``agent_runner`` on every spawn, so resume, pivot, add-seed and custom
+    prompts keep the pool mounted. False for unknown ids."""
+    with conn() as c:
+        row = c.execute("SELECT context_pool FROM investigations WHERE id=?", (inv_id,)).fetchone()
+    return bool(row and row["context_pool"])
+
+
+def get_fixture_capture(inv_id: str) -> bool:
+    """True when this investigation was created with fixture capture on
+    (``POST /api/investigations`` with ``capture: true``, admin only). Read by
+    ``agent_runner._fixture_env`` on every spawn, so resume, pivot, add-seed and
+    custom prompts keep recording into the same capture. False for unknown ids."""
+    with conn() as c:
+        row = c.execute("SELECT fixture_capture FROM investigations WHERE id=?", (inv_id,)).fetchone()
+    return bool(row and row["fixture_capture"])
 
 
 def get_vertical(inv_id: str) -> str:
@@ -314,6 +348,12 @@ def get_investigation_owner(inv_id: str) -> Optional[int]:
     return row["user_id"] if row else None
 
 
+def get_investigation_model(inv_id: str) -> Optional[str]:
+    with conn() as c:
+        row = c.execute("SELECT model FROM investigations WHERE id=?", (inv_id,)).fetchone()
+    return row["model"] if row else None
+
+
 def find_node_across_investigations(type_: str, value: str,
                                      user_id: Optional[int] = None,
                                      exclude_inv: Optional[str] = None,
@@ -378,8 +418,8 @@ def reconcile_orphaned_running() -> int:
 
     Called at startup. A service restart (deploy) or an OOM/disk-full kill ends
     the agent subprocess, but the investigation row stays `running` forever — a
-    zombie the UI shows as in-progress and no `/stop` can clear (the proc isn't
-    in this process's `_running_procs`). Since a restart means every prior
+    zombie the UI shows as in-progress (a `/stop` now flips any `running` row to
+    `done`, but nobody is there to click it). Since a restart means every prior
     `running` row has lost its worker, mark them all terminal so the user can
     rerun. Returns the number reconciled."""
     now = time.time()
@@ -450,7 +490,8 @@ def add_node(inv_id: str, type_: str, value: str, metadata: dict | None = None,
                                                      "confidence": confidence, "source": source,
                                                      "created_at": now}}
         except sqlite3.IntegrityError:
-            row = c.execute("SELECT metadata, tags, created_at FROM nodes WHERE id=?", (nid,)).fetchone()
+            row = c.execute("SELECT metadata, tags, created_at, source, confidence FROM nodes WHERE id=?",
+                            (nid,)).fetchone()
             existing_md = json.loads(row["metadata"] or "{}")
             original_created_at = row["created_at"]
             # Save old sources_seen before update() overwrites it
@@ -466,9 +507,12 @@ def add_node(inv_id: str, type_: str, value: str, metadata: dict | None = None,
             existing_tags = list(existing_tag_set | set(incoming))
             c.execute("UPDATE nodes SET metadata=?, tags=? WHERE id=?",
                       (json.dumps(existing_md), json.dumps(existing_tags), nid))
+            # The event describes the stored row. An upsert merges metadata, tags
+            # and sources_seen; `source` and `confidence` stay those of the first
+            # report, so a live client and a reload show the same node.
             event = {"kind": "node_updated", "node": {"id": nid, "type": type_, "value": value,
                                                        "metadata": existing_md, "tags": existing_tags,
-                                                       "confidence": confidence, "source": source,
+                                                       "confidence": row["confidence"], "source": row["source"],
                                                        "created_at": original_created_at}}
         c.execute("INSERT INTO events(investigation_id, kind, payload, created_at) VALUES (?,?,?,?)",
                   (inv_id, event["kind"], json.dumps(event), now))
@@ -829,44 +873,202 @@ def get_node_by_id(inv_id: str, node_id: str) -> Optional[dict]:
 
 
 def get_evidence_for_value(value: str) -> list[dict]:
-    """Search the cache table for entries whose key contains the given value.
+    """The cached source answers about a node's value, oldest first.
 
-    Returns a list of {key, value, created_at} dicts with the raw cached data.
+    Returns a list of {cache_key, data, cached_at} dicts with the raw cached data.
     This lets analysts audit what the CTI sources actually returned.
+
+    An answer is kept when its key holds the value as a whole token
+    (backend/evidence_match.py): a substring match would also return the
+    answers about `sub.<value>`, about a longer IP or hash, and, for a short
+    value, most of the cache. A value too short to look up returns nothing.
     """
-    with conn() as c:
-        rows = c.execute(
-            "SELECT key, value, created_at FROM cache WHERE key LIKE ?",
-            (f"%{value}%",),
-        ).fetchall()
+    pattern = evidence_match.like_pattern(value)
+    if pattern is None:
+        return []
     out = []
-    for r in rows:
-        try:
-            parsed = json.loads(r["value"])
-        except (json.JSONDecodeError, TypeError):
-            parsed = r["value"]
-        out.append({
-            "cache_key": r["cache_key"],
-            "data": parsed,
-            "cached_at": r["created_at"],
-        })
+    with conn() as c:
+        # Keys first: the SQL pattern is a coarse prefilter, and an answer can
+        # weigh hundreds of KB. Only the keys the matcher accepts are loaded.
+        keys = [r["key"] for r in c.execute(
+            "SELECT key FROM cache WHERE key LIKE ? ESCAPE ? ORDER BY created_at, key",
+            (pattern, evidence_match.LIKE_ESCAPE),
+        )]
+        for key in keys:
+            # The cache also holds bookkeeping rows (counters, source health):
+            # those are not a source's answer.
+            if not fixtures.is_source_key(key) or not evidence_match.key_mentions(key, value):
+                continue
+            r = c.execute("SELECT value, created_at FROM cache WHERE key=?", (key,)).fetchone()
+            if r is None:
+                continue
+            try:
+                parsed = json.loads(r["value"])
+            except (json.JSONDecodeError, TypeError):
+                parsed = r["value"]
+            out.append({
+                "cache_key": key,
+                "data": parsed,
+                "cached_at": r["created_at"],
+            })
     return out
 
 
 def cache_get(key: str, ttl: float = 86400) -> Optional[Any]:
+    # Fixture replay (EVAL_PROTOCOL §4.C): a source response comes from the
+    # fixture set, whatever the TTL and whatever this database holds.
+    if fixtures.replaying() and fixtures.is_source_key(key):
+        return fixtures.replay_get(key)
     with conn() as c:
         row = c.execute("SELECT value, created_at FROM cache WHERE key=?", (key,)).fetchone()
     if not row:
         return None
     if time.time() - row["created_at"] > ttl:
         return None
-    return json.loads(row["value"])
+    value = json.loads(row["value"])
+    # A warm cache answered the agent too: capture records hits, not only writes.
+    if fixtures.capturing():
+        fixtures.record(key, value)
+    return value
 
 
 def cache_set(key: str, value: Any):
+    if fixtures.replaying() and fixtures.is_source_key(key):
+        return  # the fixture set is the cache; replay traffic never reaches a DB
     with conn() as c:
         c.execute("INSERT OR REPLACE INTO cache(key, value, created_at) VALUES (?,?,?)",
                   (key, json.dumps(value), time.time()))
+    if fixtures.capturing():
+        fixtures.record(key, value)
+
+
+# Préfixes des clés fabriquées par sources/http_client.py (f"GET|{url}|{params}"…).
+_HTTP_CACHE_PREFIXES = ("GET|", "POST|", "TXT|", "FORM|")
+
+
+def purge_secret_cache_keys() -> int:
+    """ALV-1773 : supprime les entrées de cache dont la clé porte un paramètre
+    d'authentification, écrites avant que `http_client.cache_params` ne les retire.
+
+    Ces lignes sont orphelines (la clé actuelle ne contient plus le paramètre) et
+    gardent le secret en clair dans `cache.key`. Le filtre tourne entièrement en
+    SQL : aucune clé n'est lue côté Python, donc aucune ne peut être journalisée.
+    Idempotent : une fois purgées, plus rien ne correspond. Renvoie le nombre de
+    lignes supprimées."""
+    from .sources.http_client import _SECRET_PARAMS  # import tardif : http_client importe ce module
+
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    # repr d'un dict ('key': …) ou d'une liste de tuples (('key', …)). LIKE ignore
+    # la casse ASCII, comme la comparaison en minuscules de cache_params.
+    patterns = []
+    for p in sorted(_SECRET_PARAMS):
+        patterns += [f"%'{esc(p)}': %", f"%('{esc(p)}', %"]
+    prefix_sql = " OR ".join("key LIKE ? ESCAPE '\\'" for _ in _HTTP_CACHE_PREFIXES)
+    param_sql = " OR ".join("key LIKE ? ESCAPE '\\'" for _ in patterns)
+    args = [esc(p) + "%" for p in _HTTP_CACHE_PREFIXES] + patterns
+    with conn() as c:
+        # Sans secure_delete, les octets supprimés restent lisibles dans les pages libres du fichier.
+        c.execute("PRAGMA secure_delete = ON")
+        n = c.execute(f"DELETE FROM cache WHERE ({prefix_sql}) AND ({param_sql})", args).rowcount
+    if n:
+        # secure_delete ne suffit pas : une clé supprimée peut survivre comme séparateur
+        # dans un nœud interne de l'index de clé primaire. Seul VACUUM réécrit le fichier.
+        # Une seule fois : au démarrage suivant n == 0.
+        c = sqlite3.connect(DB_PATH)
+        try:
+            c.execute("VACUUM")
+        finally:
+            c.close()
+    return n
+
+
+# ── Per-investigation counters ────────────────────────────────────────────
+# Backed by the `cache` table (same trick as backend/source_health.py) so a
+# counter survives across the several `claude -p` phase spawns of one run — each
+# phase starts fresh MCP server processes, so an in-process counter would reset
+# and a per-investigation budget would never actually bind.
+
+def _counter_key(inv_id: str, name: str) -> str:
+    return f"counter|{inv_id}|{name}"
+
+
+def get_counter(inv_id: str, name: str) -> int:
+    """Read a per-investigation counter (0 if never bumped)."""
+    v = cache_get(_counter_key(inv_id, name), ttl=float("inf"))
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_counter(inv_id: str, name: str, delta: int = 1) -> int:
+    """Increment a per-investigation counter and return the new value."""
+    new = get_counter(inv_id, name) + int(delta)
+    cache_set(_counter_key(inv_id, name), new)
+    return new
+
+
+def list_nodes_of_type(inv_id: str, type_: str) -> list[dict]:
+    """All nodes of one type (id, value, metadata, tags, confidence, source).
+
+    Used by the context-pool lead lifecycle (list/promote leads) and by the
+    corroboration telemetry; keeps callers out of raw SQL."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, type, value, metadata, tags, confidence, source, created_at "
+            "FROM nodes WHERE investigation_id=? AND type=? ORDER BY created_at",
+            (inv_id, type_),
+        ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "type": r["type"], "value": r["value"],
+            "metadata": json.loads(r["metadata"] or "{}"),
+            "tags": json.loads(r["tags"] or "[]"),
+            "confidence": r["confidence"], "source": r["source"],
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+def set_node_tags_exclusive(inv_id: str, node_id: str, add: str,
+                            remove: set[str]) -> Optional[dict]:
+    """Add one tag while removing a set of mutually-exclusive siblings.
+
+    The lead lifecycle (unverified → corroborated | refuted | unverifiable) is a
+    state machine, not an accumulating tag bag: `tag_node` alone would leave a
+    node tagged both `unverified` and `corroborated`, which the corroboration
+    telemetry would then bucket by tag-precedence while the export filter still
+    read it as non-actionable. Emits a full `node_updated` event so connected
+    clients re-render the lead's new state live."""
+    with conn() as c:
+        row = c.execute("SELECT * FROM nodes WHERE id=? AND investigation_id=?",
+                        (node_id, inv_id)).fetchone()
+        if not row:
+            return None
+        tags = {t for t in json.loads(row["tags"] or "[]") if t not in remove}
+        if add:
+            tags.add(add)
+        c.execute("UPDATE nodes SET tags=? WHERE id=?",
+                  (json.dumps(sorted(tags)), node_id))
+        row2 = c.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
+        node = dict(row2)
+        node["metadata"] = json.loads(node.get("metadata") or "{}")
+        node["tags"] = json.loads(node.get("tags") or "[]")
+        event = {"kind": "node_updated", "node": {
+            "id": node["id"], "type": node["type"], "value": node["value"],
+            "metadata": node["metadata"], "tags": node["tags"],
+            "confidence": node.get("confidence") or 0.8,
+            "source": node.get("source") or "agent",
+            "created_at": node.get("created_at") or time.time(),
+        }}
+        c.execute(
+            "INSERT INTO events(investigation_id, kind, payload, created_at) VALUES (?,?,?,?)",
+            (inv_id, event["kind"], json.dumps(event), time.time()),
+        )
+    return node
 
 
 # ── Pivot queue (autonomy engine) ─────────────────────────────────────────
@@ -891,6 +1093,13 @@ def enqueue_pivot(inv_id: str, node_type: str, node_value: str, pivot_op: str,
             return {"id": tid, "was_new": True}
         except sqlite3.IntegrityError:
             return {"id": tid, "was_new": False}
+
+
+def complete_pivot_for(inv_id: str, node_type: str, node_value: str, pivot_op: str,
+                       status: str = "done", summary: Optional[str] = None) -> bool:
+    """Close a queued pivot addressed by (node, op) rather than by task id."""
+    return complete_pivot(_pivot_task_id(inv_id, node_type, node_value, pivot_op),
+                          status=status, summary=summary)
 
 
 def acquire_pivot(inv_id: str) -> Optional[dict]:
@@ -1279,8 +1488,29 @@ def get_share_payload(token: str) -> Optional[dict]:
         return None
     if s["expires_at"] and s["expires_at"] < time.time():
         return None
-    inv_id = s["investigation_id"]
-    sections = s["sections"]
+    view = share_view(s["investigation_id"], s["sections"])
+    if view is None:
+        return None
+    return {
+        "share": {
+            "token": s["token"],
+            "sections": s["sections"],
+            "created_at": s["created_at"],
+            "expires_at": s["expires_at"],
+            "label": s["label"],
+        },
+        **view,
+    }
+
+
+def share_view(inv_id: str, sections: list[str]) -> Optional[dict]:
+    """What a share link shows of one investigation, filtered by `sections`:
+    the investigation summary, the graph and, with 'timeline', the
+    agent-visible events. None if the investigation does not exist.
+
+    `get_share_payload` wraps it with the share's own metadata;
+    `eval/demo_export.py` freezes it into a static demo snapshot, so the demo
+    shows exactly what a share link would."""
     with conn() as c:
         inv_row = c.execute(
             "SELECT id, seed_type, seed_value, status, created_at, model FROM investigations WHERE id=?",
@@ -1301,13 +1531,6 @@ def get_share_payload(token: str) -> Optional[dict]:
     seeds = get_investigation_seeds(inv_id)
 
     payload = {
-        "share": {
-            "token": s["token"],
-            "sections": sections,
-            "created_at": s["created_at"],
-            "expires_at": s["expires_at"],
-            "label": s["label"],
-        },
         "investigation": {
             "id": inv["id"],
             "seed_type": inv["seed_type"],

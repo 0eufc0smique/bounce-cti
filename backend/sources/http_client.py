@@ -1,15 +1,48 @@
 import httpx
+from .. import fixtures
 from ..graph_store import cache_get, cache_set
 
 UA = "bounce-cti/0.1 (+research)"
 
+# Paramètres de requête qui portent un secret : ils ne doivent jamais entrer dans une clé de cache
+# (la table `cache` est copiée avec la base ; une clé qui tourne invaliderait aussi tout le cache).
+# `signature`, `sig`, `pass` en sont absents exprès : ce sont aussi des paramètres métier (MalwareBazaar
+# `get_siginfo` passe `signature=<famille>`), les retirer ferait collisionner des requêtes différentes.
+_SECRET_PARAMS = frozenset({
+    "key", "apikey", "api_key", "api-key", "x-api-key", "token", "api_token", "apitoken",
+    "access_token", "auth", "secret", "client_secret", "password",
+})
+
+
+def cache_params(params):
+    """`params` sans les paramètres d'authentification, pour fabriquer une clé de cache.
+    Accepte un dict ou une liste de tuples (httpx accepte les deux)."""
+    if not params:
+        return params
+    if isinstance(params, dict):
+        return {k: v for k, v in params.items() if str(k).lower() not in _SECRET_PARAMS}
+    try:
+        return [(k, v) for k, v in params if str(k).lower() not in _SECRET_PARAMS]
+    except (TypeError, ValueError):
+        return params
+
+
+def _replay_miss(key: str) -> None:
+    """In fixture replay a cache miss is a question the captured run never
+    asked. Fail it here, under its own name, the way a dead network fails —
+    before any request, so the offline guard is the second wall, not the first."""
+    if fixtures.replaying():
+        raise httpx.ConnectError(
+            f"{fixtures.REPLAY_MISS}: no recorded response for {fixtures.redact(key)}")
+
 
 async def get_json(url: str, headers: dict | None = None, params: dict | None = None,
                    ttl: float = 86400, cache_key: str | None = None) -> dict:
-    key = cache_key or f"GET|{url}|{params}"
+    key = cache_key or f"GET|{url}|{cache_params(params)}"
     cached = cache_get(key, ttl=ttl)
     if cached is not None:
         return cached
+    _replay_miss(key)
     h = {"User-Agent": UA}
     if headers:
         h.update(headers)
@@ -25,10 +58,11 @@ async def get_json(url: str, headers: dict | None = None, params: dict | None = 
 
 async def post_json(url: str, headers: dict | None = None, json_body: dict | None = None,
                     ttl: float = 86400, cache_key: str | None = None) -> dict:
-    key = cache_key or f"POST|{url}|{json_body}"
+    key = cache_key or f"POST|{url}|{cache_params(json_body)}"
     cached = cache_get(key, ttl=ttl)
     if cached is not None:
         return cached
+    _replay_miss(key)
     h = {"User-Agent": UA, "Content-Type": "application/json"}
     if headers:
         h.update(headers)
@@ -49,7 +83,7 @@ async def get_text(url: str, headers: dict | None = None, params: dict | None = 
     parsed JSON — needed by sources that probe HTML pages (e.g. username
     enumeration). Transient failures (status 0) are NOT cached so a network
     blip doesn't poison the cache for the full TTL."""
-    key = cache_key or f"TXT|{url}|{params}"
+    key = cache_key or f"TXT|{url}|{cache_params(params)}"
     cached = cache_get(key, ttl=ttl)
     if cached is not None:
         return cached
@@ -57,6 +91,7 @@ async def get_text(url: str, headers: dict | None = None, params: dict | None = 
     if headers:
         h.update(headers)
     try:
+        _replay_miss(key)
         async with httpx.AsyncClient(timeout=15, follow_redirects=follow_redirects) as c:
             r = await c.get(url, headers=h, params=params)
             data = {"status": r.status_code, "final_url": str(r.url), "text": r.text[:8000]}
@@ -69,10 +104,11 @@ async def get_text(url: str, headers: dict | None = None, params: dict | None = 
 async def post_form(url: str, headers: dict | None = None, form_data: dict | None = None,
                     ttl: float = 86400, cache_key: str | None = None) -> dict:
     """POST with application/x-www-form-urlencoded body (needed by MalwareBazaar, URLhaus)."""
-    key = cache_key or f"FORM|{url}|{form_data}"
+    key = cache_key or f"FORM|{url}|{cache_params(form_data)}"
     cached = cache_get(key, ttl=ttl)
     if cached is not None:
         return cached
+    _replay_miss(key)
     h = {"User-Agent": UA}
     if headers:
         h.update(headers)

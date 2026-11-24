@@ -1,5 +1,6 @@
 """Spawn Claude Code in headless mode to run an investigation."""
 import asyncio
+import contextvars
 import datetime as _dt
 import json
 import os
@@ -10,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional
 from .config import CLAUDE_BIN
+from . import context_pool
 from . import graph_store as gs
 from . import seeds
 from . import verticals
@@ -20,10 +22,24 @@ from . import verticals
 # (the CLI default applies). Mirrored by ALLOWED_EFFORTS in backend/main.py.
 _VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
-# Map a frontend model alias to the exact CLI model id. Aliases not listed pass
-# through untouched (e.g. "sonnet"/"opus"/"haiku" resolve via the CLI's own
-# latest-version aliasing).
+# Map every model alias the API accepts (main.ALLOWED_MODELS) to the exact CLI
+# model id. The bare tier names are pinned too: left to the CLI's own aliasing
+# they followed the age of the CLI installed on the host, not their "latest"
+# label. Read from the production event log on 2026-10-23, CLI 2.1.149 ran
+# "opus" as claude-opus-4-7, "sonnet" as claude-sonnet-4-6 and "haiku" as
+# claude-haiku-4-5. A tier alias points at the newest model of its tier that
+# the production CLI runs: 2.1.149 refuses claude-opus-5-5 ("version 2.1.280
+# or newer is required"), so "opus" stays on claude-opus-5 until the host CLI
+# is updated. A model newer than the CLI fails the run as `error: model`
+# (_detect_model_unsupported). backend/tests/test_model_lists_in_sync.py keeps
+# this table, the API list and both UI lists in step.
 _MODEL_ALIASES = {
+    "sonnet": "claude-sonnet-5-5",
+    "opus": "claude-opus-5",
+    "haiku": "claude-haiku-5-5",
+    "sonnet-5": "claude-sonnet-5",
+    "opus-5": "claude-opus-5",
+    "fable-5": "claude-fable-5",
     "opus-4.7": "claude-opus-4-7",
     "opus-4.8": "claude-opus-4-8",
 }
@@ -258,6 +274,25 @@ def _detect_auth_error(text: str) -> bool:
     return any(m in low for m in _AUTH_FAIL_MARKERS)
 
 
+# The host's `claude` CLI is older than the model it was asked for. Claude Code
+# answers "API Error: 400 Claude Code 2.1.149 does not support this model;
+# version 2.1.280 or newer is required. Run 'claude update' …", exits 1, and
+# still prints a `result` event (is_error). The phase logic reads that event as
+# "the agent ran", so every later phase spawned and failed the same way in
+# under a second and the run ended `done` with zero nodes (measured with the
+# production CLI version on 2026-10-23, tests/test_model_unsupported.py). Like
+# an auth failure this is an ops fix (update the CLI, or pick another model):
+# the run stops after the phase that saw it and says why. Read only from the
+# CLI's own error (an is_error `result`, stderr), never from a tool result.
+_MODEL_UNSUPPORTED_RE = re.compile(r"does not support this model", re.IGNORECASE)
+# inv_id → message, set during a phase, read by the run functions like _auth_failed.
+_model_unsupported: dict[str, str] = {}
+
+
+def _detect_model_unsupported(text: str) -> bool:
+    return bool(_MODEL_UNSUPPORTED_RE.search(text or ""))
+
+
 # A spawned `claude -p` should emit its first stream-json event (the `system`
 # init) within a few seconds. If it emits *nothing* for this long it is wedged —
 # a misconfigured binary, a broken MCP launch, or a hung handshake — not slow
@@ -269,17 +304,96 @@ _FIRST_EVENT_TIMEOUT_S = float(
     os.environ.get("BOUNCE_AGENT_FIRST_EVENT_TIMEOUT_S", "120")
 )
 
+# How often the per-phase watchdog wakes up (tests shorten it).
+_WATCHDOG_POLL_S = 10.0
+
+# Longest stream-json line kept whole in the event log. One line is one event,
+# and a `user` event carries a tool's full output: a VirusTotal or Onyphe report
+# runs to hundreds of KB. Past this cap the line is logged as
+# `agent_stdout_oversize` (its size and head) and the stream goes on.
+_STREAM_LINE_MAX = 8 * 1024 * 1024
+
+
+async def _iter_stream_lines(stream: asyncio.StreamReader,
+                             max_bytes: Optional[int] = None):
+    """Yield ``(line, size)`` for every line of ``stream``, whatever its length.
+
+    ``async for line in stream`` raises ValueError on the first line longer than
+    the reader's limit (64 KiB by default) and the loop ends there. Until
+    2026-10-15 that ended the event log of the phase at its first tool result
+    over 64 KiB, silently (see test_agent_stream_lines.py). Here a long line is
+    read in pieces and put back together. ``line`` keeps its newline (the last
+    line may have none) and holds at most ``max_bytes`` bytes; ``size`` is the
+    line's real length, so ``size > len(line)`` means the line was cut."""
+    cap = _STREAM_LINE_MAX if max_bytes is None else max_bytes
+    while True:
+        head = bytearray()
+        size = 0
+        eof = False
+        while True:
+            try:
+                piece = await stream.readuntil(b"\n")
+                ended = True
+            except asyncio.IncompleteReadError as e:
+                piece, ended, eof = e.partial, True, True
+            except asyncio.LimitOverrunError as e:
+                # No newline within the limit: e.consumed bytes are buffered and
+                # none is the newline. Take them and look again.
+                piece, ended = await stream.read(max(e.consumed, 1)), False
+            size += len(piece)
+            if len(head) < cap:
+                head += piece[:cap - len(head)]
+            if ended:
+                break
+        if size:
+            yield bytes(head), size
+        if eof:
+            return
+
 
 # Global registry of running agent processes, keyed by investigation id.
 # Used by stop_investigation() to kill a running agent on demand.
 _running_procs: dict[str, asyncio.subprocess.Process] = {}
 
+# A user stop ends the RUN, and a run is several phases, each its own process.
+# Killing the process in flight ends one phase: what a killed phase returns
+# (rc=-15, no result event) reads as a phase that failed, and the workflow went
+# on to the next one. So a stop is also counted here, per investigation, and
+# every run remembers the count it started with (_begin_run). A run whose
+# count has moved was stopped (_stopped_by_user): it spawns nothing more and
+# returns at its next check (_halt_on_user_stop).
+#
+# A count, where a flag would look simpler: a killed phase takes up to a
+# watchdog poll (10 s) to return, and a rerun clicked inside that window is a
+# second run of the same investigation. Clearing a flag when the new run starts
+# would hide the stop from the old one, which would carry on beside it. With a
+# count the old run sees a stop it predates and the new one does not.
+_stop_count: dict[str, int] = {}
+_run_started_at_stop: contextvars.ContextVar[Optional[tuple[str, int]]] = \
+    contextvars.ContextVar("bounce_run_started_at_stop", default=None)
 
-def stop_investigation(inv_id: str) -> bool:
-    """Kill the running agent process for an investigation. Returns True if killed."""
-    proc = _running_procs.pop(inv_id, None)
-    if proc is None or proc.returncode is not None:
-        return False
+
+def stop_count(inv_id: str) -> int:
+    """How many stops this investigation has been asked for. A caller that
+    chains several runs (main.py) keeps the value it started with and ends the
+    chain when it has moved."""
+    return _stop_count.get(inv_id, 0)
+
+
+def _begin_run(inv_id: str) -> None:
+    """First line of every run entry point: stops asked from now on are for
+    this run, earlier ones were for another."""
+    _run_started_at_stop.set((inv_id, stop_count(inv_id)))
+
+
+def _stopped_by_user(inv_id: str) -> bool:
+    """True when a stop was asked for this investigation since the run this
+    task belongs to began. False outside a run (a phase spawned on its own)."""
+    started = _run_started_at_stop.get()
+    return bool(started) and started[0] == inv_id and stop_count(inv_id) != started[1]
+
+
+def _kill_process(proc: asyncio.subprocess.Process) -> None:
     try:
         import signal
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -288,7 +402,34 @@ def stop_investigation(inv_id: str) -> bool:
             proc.kill()
         except Exception:
             pass
+
+
+def stop_investigation(inv_id: str) -> bool:
+    """Stop the run of an investigation: count the stop, so the run ends at its
+    next check, and kill the agent process in flight. Returns True if a process
+    was killed (False between two phases, or when nothing runs).
+
+    Called from a worker thread (the /stop route is sync). The count moves
+    BEFORE the process is looked up: _run_claude_phase registers its process
+    and then reads the count, so one side always sees the other."""
+    _stop_count[inv_id] = _stop_count.get(inv_id, 0) + 1
+    proc = _running_procs.pop(inv_id, None)
+    if proc is None or proc.returncode is not None:
+        return False
+    _kill_process(proc)
     return True
+
+
+def mark_stopped_by_user(inv_id: str) -> None:
+    """Leave a stopped investigation `done`, with the status_change that says a
+    user stopped it. Written by the /stop route at once, in the request: the
+    run itself only notices when its killed phase returns, seconds later, and
+    the sidebar is refreshed right after the request."""
+    gs.set_status(inv_id, "done")
+    with gs.conn() as c:
+        payload = {"kind": "status_change", "status": "done", "stopped_by_user": True}
+        c.execute("INSERT INTO events(investigation_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                  (inv_id, "status_change", json.dumps(payload), time.time()))
 
 
 def _log(inv_id: str, kind: str, msg):
@@ -333,10 +474,25 @@ def _finalise_auth_halt(inv_id: str, message: str) -> None:
     msg = ("Claude CLI authentication failed (401) on the host — re-authenticate "
            "the claude CLI / refresh its credential, then rerun. Detail: "
            + (message or "")[:200])
-    gs.set_status(inv_id, "error: auth")
+    _finalise_ops_error(inv_id, "error: auth", msg, "investigation_auth_failed")
+
+
+def _finalise_model_halt(inv_id: str, message: str) -> None:
+    """Mark an investigation as failed because the host CLI refused its model
+    (the CLI is older than the model id). Same shape as the auth halt: an
+    actionable message, no global cooldown."""
+    _model_unsupported.pop(inv_id, None)
+    msg = ("The host's claude CLI cannot run this model — update the claude CLI "
+           "of the service user, or rerun with another model. Detail: "
+           + (message or "")[:300])
+    _finalise_ops_error(inv_id, "error: model", msg, "investigation_model_unsupported")
+
+
+def _finalise_ops_error(inv_id: str, status: str, msg: str, log_kind: str) -> None:
+    gs.set_status(inv_id, status)
     try:
         with gs.conn() as c:
-            payload = {"kind": "status_change", "status": "error: auth",
+            payload = {"kind": "status_change", "status": status,
                        "error_message": msg}
             c.execute(
                 "INSERT INTO events(investigation_id, kind, payload, created_at) VALUES (?,?,?,?)",
@@ -344,7 +500,46 @@ def _finalise_auth_halt(inv_id: str, message: str) -> None:
             )
     except Exception:
         pass
-    _log(inv_id, "investigation_auth_failed", {"message": msg})
+    _log(inv_id, log_kind, {"message": msg})
+
+
+def _halt_on_ops_error(inv_id: str) -> bool:
+    """End the run if a phase hit an error no further phase can get past (the
+    CLI's credential, or a model the CLI cannot run). True when it did."""
+    if _auth_failed.get(inv_id):
+        _finalise_auth_halt(inv_id, _auth_failed[inv_id])
+        return True
+    if _model_unsupported.get(inv_id):
+        _finalise_model_halt(inv_id, _model_unsupported[inv_id])
+        return True
+    return False
+
+
+def _halt_on_user_stop(inv_id: str, rc=None, *, during: Optional[str] = None,
+                       phase: Optional[str] = None) -> bool:
+    """End the run if a user stopped it. True when it did.
+
+    Checked after every phase, before the quota and ops halts: the status of a
+    stopped investigation is the one the /stop route wrote, and nothing here
+    writes it again (a rerun may already own the row, see _stop_count). The
+    run only says it ended, on the event its listeners wait for. `phase` is the
+    label the follow-up runs put on their agent_exit, `during` the phase of the
+    main workflow that was in flight."""
+    if not _stopped_by_user(inv_id):
+        return False
+    payload = {"rc": rc, "status": "done", "stopped_by_user": True}
+    if phase:
+        payload["phase"] = phase
+    if during:
+        payload["stopped_during"] = during
+    _log(inv_id, "agent_exit", payload)
+    return True
+
+
+def _clear_ops_errors(inv_id: str) -> None:
+    """Drop flags a crashed earlier run may have left behind."""
+    _auth_failed.pop(inv_id, None)
+    _model_unsupported.pop(inv_id, None)
 
 
 async def _dd_sanctions_sweep(inv_id: str) -> None:
@@ -853,22 +1048,41 @@ def _adaptive_followup_targets(inv_id: str) -> list:
         #       never triggered).
         ip_branch_fires = bool(cdn_ips) or (not ip_nodes and cert_evidence)
         if ip_branch_fires:
-            shodan_called_with_cn = any(
+            # Free-first ordering. The unmask needs candidate origin *IPs*, and
+            # shodan_host_count returns counts/facets rather than hosts — so it
+            # is used as the free triage step (a count of 0 means there is no
+            # origin to unmask and nothing further is worth spending), while the
+            # host-returning work goes to sources that don't bill query credits:
+            # Onyphe datascan and Netlas. shodan_search would return the hosts
+            # directly but costs a query credit per 100 and is gated off by
+            # default, so it is deliberately NOT enforced here.
+            shodan_counted_cn = any(
                 "ssl.cert.subject.cn" in arg
-                for (tool, arg) in called if tool == "shodan_search"
+                for (tool, arg) in called
+                if tool in ("shodan_host_count", "shodan_search")
             )
             onyphe_called_with_cn = any(
                 "tls.cert.subject.commonname" in arg
                 for (tool, arg) in called if tool == "onyphe_datascan"
             )
+            netlas_called_with_cn = any(
+                "certificate.subject.common_name" in arg
+                for (tool, arg) in called if tool == "netlas_search"
+            )
             cn_unmask_calls = []
-            if not shodan_called_with_cn:
+            if not shodan_counted_cn:
                 cn_unmask_calls.append(
-                    f"shodan_search(\"ssl.cert.subject.CN:\\\"{seed_domain}\\\"\")"
+                    f"shodan_host_count(\"ssl.cert.subject.CN:\\\"{seed_domain}\\\"\", "
+                    f"facets=\"asn,org,country\")  [FREE — 0 query credits]"
                 )
             if not onyphe_called_with_cn:
                 cn_unmask_calls.append(
                     f"onyphe_datascan(\"tls.cert.subject.commonname:\\\"{seed_domain}\\\"\")"
+                )
+            if not netlas_called_with_cn:
+                cn_unmask_calls.append(
+                    f"netlas_search(\"certificate.subject.common_name:\\\"{seed_domain}\\\"\")"
+                    f"  [FREE tier — returns the candidate origin hosts]"
                 )
             key_unmask = ("domain", f"{seed_domain.lower()}::cn_unmask")
             if cn_unmask_calls and key_unmask not in seen_keys:
@@ -972,6 +1186,79 @@ def _adaptive_followup_targets(inv_id: str) -> list:
     return targets[:20]
 
 
+# Seed tags that mean the seed itself is malicious. Shared by _is_parked (a
+# malicious seed is never short-circuited as parked) and _concluded_benign (a
+# malicious seed is never treated as a benign verdict). Campaign-specific tags
+# (e.g. clearfake_c2, lummac2) are caught by the substring pass; generic family
+# tags by the set membership.
+_MALICIOUS_SEED_TAGS = {
+    "malicious", "c2", "phishing", "botnet", "ransomware", "dropper",
+    "loader", "stealer", "trojan", "rat", "malware", "dga", "apt",
+}
+_MALICIOUS_SEED_SUBSTR = ("c2", "malware", "phish", "ransom", "botnet",
+                          "dropper", "loader", "stealer", "trojan")
+
+
+def _seed_tags_malicious(stags: list[str]) -> bool:
+    return bool(set(stags) & _MALICIOUS_SEED_TAGS
+                or any(sub in t for t in stags for sub in _MALICIOUS_SEED_SUBSTR))
+
+
+# A threat_assessment that reads as a benign verdict. The schema asks for
+# benign|suspicious|likely_malicious|malicious, but 45 of 262 production
+# summaries are off that list, and the benign ones lead with the verdict:
+# "benign_infrastructure", "likely_benign", "BENIGN — IANA reserved…",
+# "Not malicious. …", "LOW — no malicious indicators…". The malicious ones
+# lead with theirs ("High confidence malicious…", "HIGH — …", "likely_scam"),
+# so the leading words decide; anything else is not a benign verdict.
+_BENIGN_ASSESSMENT = re.compile(r"^(benign|likely[ _-]?benign|not[ _-]?malicious|low)(?![a-z])")
+
+
+def _assessment_is_benign(value) -> bool:
+    return bool(_BENIGN_ASSESSMENT.match(str(value or "").strip().lower()))
+
+
+def _concluded_benign(nodes: list[dict]) -> dict | None:
+    """The investigation's own verdict that its seed is legitimate, or None.
+
+    A verdict only when three statements agree: every `working_hypothesis`
+    says `legitimate`, the `investigation_summary` threat_assessment reads as
+    benign (`_assessment_is_benign`), and no seed node carries a malicious tag.
+    Any of them missing or saying otherwise → None (no verdict, the run goes on
+    as before).
+
+    The system prompt already tells the agent, for `legitimate`: "if all return
+    clean, write benign report and STOP (don't over-investigate)". The
+    autonomous pivot drain is the one phase that did not hear it: on N2
+    (`cdn.jsdelivr.net`, 2026-10-21) main + followup concluded benign at 31
+    nodes, then three drain rounds ran urlhaus_host on the CDN and graphed an
+    unrelated ACRStealer/ClearFake cluster from its 332 abuse URLs (31 → 65
+    nodes, 8 infra nodes tagged malicious, 3 kit/family nodes → RST 0)."""
+    hypotheses = []
+    assessment = None
+    seeds = []
+    for n in nodes:
+        ntype = (n.get("type") or "").lower()
+        value = (n.get("value") or "").lower()
+        md = n.get("metadata") or {}
+        if ntype == "report" and value.startswith("working_hypothesis"):
+            hypotheses.append(str(md.get("category") or md.get("candidate_category") or "").lower())
+        elif ntype == "report" and value == "investigation_summary":
+            assessment = md.get("threat_assessment")
+        if "seed" in [str(t).lower() for t in (n.get("tags") or [])]:
+            seeds.append([str(t).lower() for t in (n.get("tags") or [])])
+    # Every hypothesis node must say legitimate: a second one that disagrees
+    # (re-hypothesized after a surprise) is not a verdict.
+    if not hypotheses or any(h != "legitimate" for h in hypotheses):
+        return None
+    if not _assessment_is_benign(assessment) or not seeds:
+        return None
+    if any(_seed_tags_malicious(st) for st in seeds):
+        return None
+    return {"hypothesis": "legitimate",
+            "threat_assessment": str(assessment).strip()[:120]}
+
+
 def _is_parked(inv_id: str) -> bool:
     """Check if the seed is parked / blackholed / sinkholed in a way that
     short-circuits phase 2 + hypothesis + follow-up.
@@ -998,12 +1285,6 @@ def _is_parked(inv_id: str) -> bool:
         # clearfake_c2/c2/malicious/dga (VT malicious=15) but
         # ns1/ns2.renewyourname.net were tagged `parking`, so the entire followup
         # phase (incl. the mandatory cert-CN origin unmask) was skipped.
-        MALICIOUS_SEED_TAGS = {
-            "malicious", "c2", "phishing", "botnet", "ransomware", "dropper",
-            "loader", "stealer", "trojan", "rat", "malware", "dga", "apt",
-        }
-        MALICIOUS_SUBSTR = ("c2", "malware", "phish", "ransom", "botnet",
-                            "dropper", "loader", "stealer", "trojan")
         for n in nodes:
             if "seed" not in [t.lower() for t in (n.get("tags") or [])]:
                 continue
@@ -1011,10 +1292,7 @@ def _is_parked(inv_id: str) -> bool:
             smd = n.get("metadata") or {}
             if "le_seized" in stags or (smd.get("sinkhole_kind") or "").lower() == "le_seized":
                 return False
-            # Campaign-specific tags (e.g. clearfake_c2, lummac2) are caught by
-            # the substring pass; generic family tags by the set membership.
-            if (set(stags) & MALICIOUS_SEED_TAGS
-                    or any(sub in t for t in stags for sub in MALICIOUS_SUBSTR)):
+            if _seed_tags_malicious(stags):
                 return False
         for n in nodes:
             # NS parking ≠ seed parking: a domain registrar's parking
@@ -1290,6 +1568,65 @@ def _mcp_launcher() -> str:
     return str(p).replace("\\", "/")
 
 
+_FIXTURE_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _fixture_env(inv_id: str, env: dict) -> dict:
+    """Fixture switches for this investigation's MCP servers (EVAL_PROTOCOL §4.C,
+    backend/fixtures.py).
+
+    ``BOUNCE_FIXTURE_DIR`` (replay) is made absolute: the servers do not share
+    the backend's cwd; its misses are logged to
+    ``data/fixtures/replay-misses/<inv_id>.jsonl``, one line each, which is how
+    far the replayed agent strayed from the captured one.
+    ``BOUNCE_FIXTURE_CAPTURE=1`` becomes a capture directory of this
+    investigation's own, ``data/fixtures/capture/<inv_id>/``, so two
+    investigations captured in the same window never mix their responses.
+    Both are read from the environment or ``.env``; ``.env`` is re-read for every
+    investigation, so flipping capture on needs no restart. An investigation
+    created with ``capture: true`` (admin only, stored in
+    ``investigations.fixture_capture``) captures the same way without touching
+    ``.env``, and keeps doing so on resume, pivot, add-seed and custom prompts.
+    Replay wins when both are set. Neither set → ``{}``: the generated config
+    is unchanged.
+    """
+    replay = (env.get("BOUNCE_FIXTURE_DIR") or "").strip()
+    if replay:
+        p = Path(replay)
+        return {"BOUNCE_FIXTURE_DIR": str(p if p.is_absolute() else ROOT / p),
+                "BOUNCE_FIXTURE_MISSES":
+                str(ROOT / "data" / "fixtures" / "replay-misses" / f"{inv_id}.jsonl")}
+    if ((env.get("BOUNCE_FIXTURE_CAPTURE") or "").strip().lower() in _FIXTURE_TRUTHY
+            or gs.get_fixture_capture(inv_id)):
+        return {"BOUNCE_FIXTURE_CAPTURE_DIR": str(fixture_capture_dir(inv_id))}
+    return {}
+
+
+def fixture_capture_dir(inv_id: str) -> Path:
+    """Where an investigation's fixture capture is recorded."""
+    return ROOT / "data" / "fixtures" / "capture" / inv_id
+
+
+def reset_fixture_capture(inv_id: str) -> bool:
+    """Drop an investigation's capture, before a rerun or with the investigation
+    itself. A capture belongs to one run: the rerun clears that run's graph and
+    events, and responses it left on disk would end up in the rerun's fixture
+    set, mixing two data windows. Returns True when a capture was removed.
+    Never raises: the caller has already cleared or deleted the investigation,
+    and a 500 at that point would leave a rerun cleared but never started."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", inv_id or ""):
+        return False  # never let an id like ".." point rmtree at a parent
+    d = fixture_capture_dir(inv_id)
+    if not d.is_dir():
+        return False
+    try:
+        shutil.rmtree(d)
+    except OSError as e:
+        print(f"[fixtures] could not remove the capture of {inv_id}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
 def _write_mcp_config(inv_id: str) -> Path:
     """Write a per-investigation mcp.json with correct paths for WSL claude.
 
@@ -1308,7 +1645,9 @@ def _write_mcp_config(inv_id: str) -> Path:
                  "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
                  # API keys
                  "VIRUSTOTAL_API_KEY", "URLSCAN_API_KEY", "ONYPHE_API_KEY",
-                 "SHODAN_API_KEY", "OTX_API_KEY")
+                 "SHODAN_API_KEY", "OTX_API_KEY",
+                 # Fixture capture/replay switches (EVAL_PROTOCOL §4.C)
+                 "BOUNCE_FIXTURE_CAPTURE", "BOUNCE_FIXTURE_DIR")
     }
     # Load .env file values explicitly so they are available to MCP servers
     env_file = ROOT / ".env"
@@ -1319,6 +1658,7 @@ def _write_mcp_config(inv_id: str) -> Path:
                 k, _, v = line.partition("=")
                 if k.strip() and k.strip() not in base_env:
                     base_env[k.strip()] = v.strip()
+    base_env.update(_fixture_env(inv_id, base_env))
 
     # Select the source pool for this investigation's vertical. The pool id is
     # used as the MCP server key (tool namespace mcp__<pool>__*) and maps to the
@@ -1342,6 +1682,17 @@ def _write_mcp_config(inv_id: str) -> Path:
             },
         }
     }
+    # The context pool (model memory + wrapped open web) mounts alongside the
+    # source pool under its own mcp__ctx__* namespace, so its calls are counted,
+    # budgeted and whitelisted separately from the source-pool budget the
+    # EVAL_PROTOCOL §4.5 bands are calibrated on. It needs BOUNCE_INV_ID because
+    # it writes lead nodes and enforces the per-investigation ctx budget.
+    if _context_pool_on(inv_id, vertical):
+        cfg["mcpServers"][verticals.CONTEXT_POOL_KEY] = {
+            "command": python,
+            "args": [launcher, verticals.CONTEXT_POOL_MODULE],
+            "env": {**base_env, "BOUNCE_INV_ID": inv_id},
+        }
     p = ROOT / "data" / f"mcp-{inv_id}.json"
     p.write_text(json.dumps(cfg, indent=2))
     return p
@@ -1393,7 +1744,7 @@ R4. Budget (yield-based, not flat cap) — STRICTLY ENFORCED:
 R5. ALWAYS set source= to the API name that produced the data (e.g. "virustotal", "crtsh", "rdap", "dns").
 R6. ALWAYS add edges between nodes. A node with no edges is useless to the analyst.
 R7. Steps marked MANDATORY must be executed. Do NOT skip threat intel (STEP 6), malware hash lookups (communicating_files), or the report node (STEP 8).
-R8. JARM pivot rule: if you extract a JARM fingerprint from ANY source (VT, Onyphe, Shodan), you MUST call shodan_search("ssl.jarm:<jarm>") to find related infrastructure. This is one of the highest-value pivots.
+R8. JARM pivot rule: if you extract a JARM fingerprint from ANY source (VT, Onyphe, Shodan), you MUST pivot on it — this is one of the highest-value pivots. Use the FREE path: shodan_host_count("ssl.jarm:<jarm>", facets="asn,org,country,port") for the cluster size/shape, plus netlas_jarm/zoomeye_jarm/urlscan_search("hash:<jarm>") to graph the member hosts. (shodan_search costs a query credit and is gated off by default.)
 R9. MANDATORY: virustotal_communicating_files MUST be called for EVERY investigation (domain or IP seed). This is the primary way to discover malware samples communicating with the indicator. Skipping it produces an incomplete investigation. Call it in STEP 3 a3 (domain) or STEP 4 a (IP).
 R10. Execute ALL workflow steps in order. Do not stop early because the graph "looks complete". The investigation is only complete when the report node (STEP 8/7) is written.
 R11. EVIDENCE-BASED CONCLUSIONS ONLY. The `threat_assessment` field MUST default to "benign".
@@ -1438,7 +1789,7 @@ R14. CLOUDFLARE-FRONTED DOMAIN — ORIGIN-UNMASK IS MANDATORY. If the seed's
     AND DO NOT STOP. You MUST:
       (a) crtsh_subdomains(<seed>) + crtsh_query(<seed>) — extract cert serial
           and cert subject CN
-      (b) shodan_search('ssl.cert.subject.CN:"<seed_fqdn>"') — the canonical
+      (b) shodan_host_count('ssl.cert.subject.CN:"<seed_fqdn>"') — the canonical
           origin-unmask query. Every returned IP is a candidate origin; add it
           as an ip node with source="shodan" and an edge cert→ip (same_cert).
       (c) onyphe_datascan('tls.cert.subject.commonname:"<seed_fqdn>"') as a
@@ -1559,7 +1910,7 @@ DOM FINGERPRINTS (dom_fingerprints):
   bech32, ETH, XMR — drainer kits).
   Call it on EVERY url node you graph for a phishing/scam seed (drainer kits,
   fake-update pages, smishing landings, fake-government). Each tracking_id and
-  favicon_hash becomes a NEW pivot via shodan_search/netlas/zoomeye.
+  favicon_hash becomes a NEW pivot via shodan_host_count (free)/netlas/zoomeye.
 
 WHOXY (whoxy_reverse): registrant email/name/keyword → list of registered domains.
   Call it whenever rdap_domain returned a NON-PRIVACY-PROTECTED registrant_email
@@ -1597,12 +1948,36 @@ OPENPHISH (openphish_check): community phishing feed corroboration.
 ══════════════════════════════════════════════
 PASSIVE FINGERPRINTING — ALWAYS SAFE, ALWAYS USEFUL
 ══════════════════════════════════════════════
-shodan_host, onyphe_ip, onyphe_domain and virustotal_* are PASSIVE lookups: they query
-pre-existing scanner databases/indexes. They do NOT touch the target server. Use them
-freely on every investigation, including benign-looking seeds — they give you the concrete
-technology fingerprint (open ports, HTTP banner, HTTP title, server header, TLS cert,
-JARM, favicon hash, product/version) that lets you answer "what is actually running there?"
-without any active probe.
+internetdb_ip, shodan_host, shodan_host_count, onyphe_ip, onyphe_domain and virustotal_*
+are PASSIVE lookups: they query pre-existing scanner databases/indexes. They do NOT touch
+the target server. Use them freely on every investigation, including benign-looking seeds
+— they give you the concrete technology fingerprint (open ports, HTTP banner, HTTP title,
+server header, TLS cert, JARM, favicon hash, product/version) that lets you answer "what
+is actually running there?" without any active probe.
+
+SHODAN COST MODEL — READ THIS BEFORE ANY SHODAN CALL:
+  Shodan bills QUERY CREDITS (100/month for the whole instance, shared across every
+  investigation), but almost everything is FREE:
+    • internetdb_ip(ip)              → 0 credits, NO KEY. ports/CPEs/CVEs/hostnames/tags.
+                                       Run it on EVERY ip node — it is the cheapest
+                                       exposure answer that exists. (~weekly refresh,
+                                       no banners.)
+    • shodan_host(ip)                → 0 credits. Full record incl. banners, TLS, JARM.
+    • shodan_host_count(query,facets)→ 0 credits. Result COUNT + FACET breakdown for any
+                                       query — including the filtered cluster queries
+                                       (ssl.jarm:, http.favicon.hash:, ssl.cert.subject.CN:,
+                                       asn:). This is your cluster pivot.
+    • shodan_api_info()              → 0 credits. Plan + remaining credits + local policy.
+  ONLY shodan_search COSTS A CREDIT (1 per 100 results, whenever the query has a filter or
+  pages past page 1), and it is DISABLED BY DEFAULT — it will refuse and tell you the free
+  alternative. Do NOT treat that refusal as a broken tool or retry it in a loop.
+
+  So the cluster-pivot order is: shodan_host_count(...) for size + facets (free) → then
+  graph the actual member hosts with the free scanners (netlas_jarm / netlas_favicon /
+  netlas_search, zoomeye_jarm / zoomeye_favicon, urlscan_search('hash:<jarm>'),
+  crtsh_serial / crtsh_query / certspotter_serial). A count of 0 is itself a finding:
+  record it and move on. Never write "I could not check the cluster because Shodan is
+  credit-limited" — you can always check it for free with shodan_host_count.
 
 For any IP node you encounter (seed or pivoted), you SHOULD capture into ip metadata:
   open_ports, http_title, http_server, http_banner (truncated), technologies[], jarm,
@@ -1699,7 +2074,7 @@ the country is an authoritative attribute of the source record, not an inferred 
 Source caveats you MUST be aware of:
   - virustotal_resolutions_*: capped at 40 results by the API (we already request the max). If you see exactly 40, assume there is more — note "truncated at 40" in metadata.
   - urlscan_search: returns up to 50 hits per query. Use multiple targeted queries (domain:, ip:, hash:, page.title:) rather than one broad one.
-  - shodan_search: free tier has tight monthly credit limits — use it ONLY for the high-signal pivots in STEP 7 (jarm/favicon/cert/asn).
+  - shodan_search: costs a query credit per 100 results and is DISABLED BY DEFAULT (the instance has 100 credits/month total). Use shodan_host_count(query, facets=...) instead — same query, cluster size + facets, 0 credits. shodan_host and internetdb_ip are also free; only *search* bills.
   - virustotal_*: free tier ≈ 4 req/min — if you see a rate-limit response, the harness will pause; you do not need to retry manually, but try to space VT calls.
   - crtsh_subdomains: very large for popular domains — pick 40 most recent and note total in metadata.
   - rdap on .ru/.cn/.ua TLDs is often partial — fall back to virustotal_domain whois.
@@ -1817,7 +2192,7 @@ The category drives which pivots are HIGHEST-leverage. Quick reference:
   commodity_malware      → virustotal_communicating_files,
                            malwarebazaar_signature, threatfox_search,
                            otx_file → enumerate sample family
-  fronted_c2             → R14: crtsh_query(subject CN), shodan_search
+  fronted_c2             → R14: crtsh_query(subject CN), shodan_host_count
                            ('ssl.cert.subject.CN:"<seed>"'), onyphe_datascan,
                            virustotal_resolutions_domain (non-CDN historical)
   traffer_or_tds         → virustotal_resolutions_ip on the FRONT IP (this
@@ -2015,26 +2390,28 @@ STEP 7 — SIMILAR ATTACK PATTERN HUNTING (do this aggressively — go as far as
   analyst sees the cluster, not just the seed.
 
   a. JARM fingerprint pivot — if you found a JARM that is NOT a well-known CDN JARM:
-     → shodan_search("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") AND
+     → shodan_host_count("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") AND
        netlas_jarm(<jarm>) AND zoomeye_jarm(<jarm>) AND urlscan_search("hash:<jarm>")
-     → Multi-source is intentional: each scanner has different vantage. Onyphe may miss
-       what Netlas catches; Shodan free tier is credit-limited so Netlas+ZoomEye fill in.
+     → Division of labour: shodan_host_count gives the cluster SIZE + facets (asn/org/
+       country) for 0 credits but returns NO hosts; onyphe/netlas/zoomeye/urlscan return
+       the actual member hosts. Multi-source is intentional — each scanner has a different
+       vantage, and Onyphe may miss what Netlas catches.
      → For EACH hit in the merged results, you MUST add_node(ip, <ip>) AND
        add_edge(<seed>→<ip>, same_jarm, source=<shodan|onyphe|netlas|zoomeye|urlscan>).
        Graph the top 10 distinct IPs (across sources, by ASN diversity).
      → Do NOT summarize the cluster in free text — every member is a node.
   b. Favicon hash pivot — if VT/onyphe/dom_fingerprints exposed a favicon hash:
      → add_node(favicon_hash, <hash>, source=<from>) FIRST (so it auto-enqueues lookups)
-     → shodan_search("http.favicon.hash:<hash>") AND onyphe_datascan("favicon:<hash>") AND
+     → shodan_host_count("http.favicon.hash:<hash>") AND onyphe_datascan("favicon:<hash>") AND
        netlas_favicon(<hash>) AND zoomeye_favicon(<hash>)
      → For matches: add_node(ip), add_edge(<seed>→<ip>, same_favicon, source=<...>)
   c. Certificate pivot — if you found a cert serial/SHA1/SHA256:
-     → shodan_search("ssl.cert.serial:<serial>") AND crtsh_serial(<serial>) AND
+     → shodan_host_count("ssl.cert.serial:<serial>") AND crtsh_serial(<serial>) AND
        certspotter_serial(<serial>) — third source to catch what crt.sh missed
      → add_edge(<seed>→<other>, same_cert)
      → certspotter_issuances(<seed>) for a richer issuance history than crt.sh on edge cases
   d. NS-set pivot — if the domain uses an unusual NS set (not parking, not big providers):
-     → If shodan_search or urlscan_search reveal other domains using the EXACT same NS set:
+     → If netlas_search or urlscan_search reveal other domains using the EXACT same NS set:
          add_edge(<seed>→<domain>, same_ns_set)  ← this is one of the strongest pivots
   e. Registrant pivot — if RDAP exposed a registrant email/org that is NOT privacy-protected:
      → add_node(email, <email>) FIRST so the queue auto-enqueues whoxy_reverse
@@ -2054,7 +2431,7 @@ STEP 7 — SIMILAR ATTACK PATTERN HUNTING (do this aggressively — go as far as
      → urlscan_search("page.title:\"<title>\"") to find lookalike phishing pages
      → add_edge(<seed>→<url>, same_page_template)
   h. ASN/CIDR neighbourhood — if the IP is on a small/abused ASN (NOT a big cloud):
-     → shodan_search("asn:<ASN> port:443") AND netlas_search("asn:<ASN>")
+     → shodan_host_count("asn:<ASN> port:443") AND netlas_search("asn:<ASN>")
      → Look for hosts with same JARM/title. Tag the ASN node "abused_asn" if you find
        multiple suspicious neighbours.
   i. DOM fingerprint pivot — if the seed (or any url node) is a phishing/scam page:
@@ -2093,7 +2470,7 @@ STEP 8 — Final report (MANDATORY — always do this last)
     □ otx_domain(<seed>)
     □ onyphe_domain(<seed>)                           — second-source fingerprinting
     □ onyphe_ctl(<seed>)                              — CT-log SAN pivots
-    □ shodan_search("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") — if JARM found, not CDN
+    □ shodan_host_count("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") — if JARM found, not CDN
     □ STEP 7.5 self-critique completed (requeue_missing + coverage_matrix + gaps_report)
   If any are unchecked, do NOT write the report yet. Go call them first.
 
@@ -2196,10 +2573,14 @@ STEP 2 — Core enrichment (call ALL tools a-j in this step — do not proceed t
      → For each co-resident domain (max 15): add_node(domain), add_edge(ip→domain, co_resolves)
   k. threatfox_search(<seed>) — MANDATORY
      → If hits: tag ip c2/botnet, add_node(report), add_edge(ip→report, known_ioc)
-  l. IF a JARM was found in step b/c: shodan_search("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") — MANDATORY
-     → Merge hits from both sources. For EACH distinct IP in the union (top 10 by diversity
-       of ASN), you MUST add_node(ip, <ip>) and add_edge(seed_ip→new_ip, same_jarm, source=<shodan|onyphe>).
-       Silently summarizing "found N matches on Shodan" in prose without graphing is a failure.
+  l. IF a JARM was found in step b/c — MANDATORY:
+     → shodan_host_count("ssl.jarm:<jarm>", facets="asn,org,country") for the cluster SIZE
+       and shape (FREE, returns no hosts), AND onyphe_datascan("jarm:<jarm>") +
+       netlas_jarm(<jarm>) + urlscan_search("hash:<jarm>") for the member HOSTS.
+     → Merge hits from the host-returning sources. For EACH distinct IP in the union (top 10
+       by diversity of ASN), you MUST add_node(ip, <ip>) and add_edge(seed_ip→new_ip,
+       same_jarm, source=<onyphe|netlas|urlscan>).
+       Silently summarizing "found N matches" in prose without graphing is a failure.
 
 STEP 3 — Passive DNS / Co-resident domains
   a. virustotal_resolutions_ip(<seed>)
@@ -2235,7 +2616,7 @@ STEP 5 — Certificate SAN pivot (IMPORTANT — this is often the strongest IP�
 
 STEP 6 — SIMILAR ATTACK PATTERN HUNTING (go as far as budget allows)
   a. JARM fingerprint pivot — if you found a JARM that is NOT a well-known CDN JARM:
-     → shodan_search("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") AND
+     → shodan_host_count("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") AND
        urlscan_search("hash:<jarm>")  ← urlscan is FREE-TIER, always attempt it
      → MANDATORY GRAPHING: for each distinct IP in the union of results (top 10 by ASN diversity),
        add_node(ip, <ip>) + add_edge(seed_ip→new_ip, same_jarm, source=<shodan|onyphe|urlscan>,
@@ -2244,7 +2625,7 @@ STEP 6 — SIMILAR ATTACK PATTERN HUNTING (go as far as budget allows)
        JARM path; take every hit there and graph it.
      → virustotal_ip on top 2 new IPs → extract their certs/domains for further clustering
   b. Certificate serial / issuer-CN pivot — essential free-tier fallback:
-     → shodan_search("ssl.cert.serial:<serial>") AND onyphe_datascan("tls.cert.serial:<serial>")
+     → shodan_host_count("ssl.cert.serial:<serial>") AND onyphe_datascan("tls.cert.serial:<serial>")
      → crtsh_serial(<serial>) — ALWAYS call this (free, no tier). For each host in digest.hosts
        not already in graph (max 10): add_node(domain, <host>) or add_node(ip, <host>) if the
        value parses as an IP; add_edge(seed→<host>, same_cert, source="crtsh",
@@ -2252,7 +2633,7 @@ STEP 6 — SIMILAR ATTACK PATTERN HUNTING (go as far as budget allows)
      → If the cert has a rare/actor-distinctive issuer organisation (e.g. O='1314520.com'),
        crtsh_query("<issuer_org>", match="ILIKE") — graph any additional CNs found.
   c. Favicon hash pivot — if onyphe/VT exposed favicon hash:
-     → shodan_search("http.favicon.hash:<hash>") AND onyphe_datascan("favicon:<hash>")
+     → shodan_host_count("http.favicon.hash:<hash>") AND onyphe_datascan("favicon:<hash>")
      → urlscan_search("hash:<hash>") as a free-tier complement; graph matches.
      → For matches: add_node(ip), add_edge(same_favicon)
   d. Onyphe pastries pivot — if the ip has been leaked in paste dumps:
@@ -2270,7 +2651,7 @@ STEP 7 — Final report (MANDATORY — always do this last)
     □ threatfox_search(<seed>)
     □ onyphe_ip(<seed>)
     □ onyphe_threatlist(<seed>)
-    □ shodan_search("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") — if JARM found
+    □ shodan_host_count("ssl.jarm:<jarm>") AND onyphe_datascan("jarm:<jarm>") — if JARM found
     □ virustotal_resolutions_ip(<seed>)
   If any are unchecked, do NOT write the report yet. Go call them first.
 
@@ -2318,12 +2699,17 @@ The investigation's purpose is to surface the CLUSTER of hosts sharing this
 fingerprint and flag it if that cluster is threat-associated.
 
 STEP 1: add_node(jarm, <seed>, tags=["seed"])
-STEP 2: shodan_search("ssl.jarm:<seed>") — MANDATORY
+STEP 2: shodan_host_count("ssl.jarm:<seed>", facets="asn,org,country,port") — MANDATORY
+  → FREE (0 query credits). This returns the cluster SIZE and facet breakdown, NOT the
+    hosts. Record total + top facets in the jarm node metadata as evidence.
+  → If total is 0, the fingerprint has no live cluster: record that and skip to STEP 5.
+  → If total is > 200, note "common_jarm_likely_cdn" in seed metadata.
+STEP 2b: Get the member HOSTS from the free scanners — netlas_jarm(<seed>) AND
+  zoomeye_jarm(<seed>) (and onyphe_datascan("jarm:<seed>") if available).
   → For each result (max 20 hosts): add_node(ip, <ip>, metadata={port, org, asn})
     and add_edge(ip→jarm, has_jarm). Do NOT defuse before adding the node, but DO
     defuse(ip, <ip>) before running any further IP enrichment in STEP 4.
-  → If the result set is > 200 matches, note "common_jarm_likely_cdn" in seed
-    metadata and still keep 10 representative hosts.
+  → Keep 10 representative hosts when the cluster is large.
 STEP 3: urlscan_search("hash:<seed>") — cross-source confirmation
   → For each scan result: if a page_url is present, add_node(url), add_edge(url→jarm, has_jarm)
 STEP 4: Pick top 3 distinct IPs (by diversity of ASN/org) and run a LIGHT IP workflow:
@@ -2335,7 +2721,7 @@ STEP 6: Final report (value="investigation_summary"). In key_findings include th
   cluster size, dominant ASN(s), and whether any cluster member is directly flagged.
   Follow R11 — the JARM is only malicious if at least one concrete detection hit exists.
   Before writing the report verify:
-    □ shodan_search("ssl.jarm:<seed>")
+    □ shodan_host_count("ssl.jarm:<seed>")
     □ threatfox_search(<seed>)
   add_edge(jarm→report, known_ioc)
 
@@ -2347,8 +2733,10 @@ equivalent. The goal is to characterize the AS and surface any abuse cluster
 within it WITHOUT trying to enumerate every host (ASes can hold millions of IPs).
 
 STEP 1: add_node(asn, <seed>, tags=["seed"])  (normalized form "AS<digits>")
-STEP 2: shodan_search("asn:<seed>") — MANDATORY, with a narrowing filter.
-  Prefer "asn:<seed> port:443" to keep the result set manageable. For each hit
+STEP 2: shodan_host_count("asn:<seed> port:443", facets="org,country,product") — MANDATORY.
+  FREE (0 query credits). Returns how many web-facing hosts the ASN holds and what they
+  run — record total + top facets in the asn node metadata. It does NOT return hosts.
+STEP 2b: Get the member HOSTS free via netlas_search("asn:<seed>"). For each hit
   (max 20): add_node(ip), add_edge(ip→asn, hosted_on_asn), add_edge(asn→ip, announces).
   Store open_ports, http_title, jarm in ip metadata.
 STEP 3: For the top 5 IPs with the most interesting fingerprints (non-generic
@@ -2501,6 +2889,8 @@ _ALLOWED_TOOLS = (
     "mcp__cti__onyphe_ctl,mcp__cti__onyphe_pastries,mcp__cti__onyphe_geoloc,"
     "mcp__cti__ip_api_lookup,mcp__cti__ip_api_batch_lookup,mcp__cti__ip_api_edns,"
     "mcp__cti__shodan_host,mcp__cti__shodan_search,"
+    "mcp__cti__shodan_host_count,mcp__cti__shodan_api_info,"
+    "mcp__cti__internetdb_ip,"
     "mcp__cti__otx_domain,mcp__cti__otx_ip,mcp__cti__otx_file,"
     "mcp__cti__threatfox_search,mcp__cti__wayback,"
     "mcp__cti__mnemonic_pdns,"
@@ -2516,6 +2906,11 @@ _ALLOWED_TOOLS = (
     "mcp__cti__openphish_check,"
     "mcp__cti__dom_fingerprints"
 )
+# NB: the native WebSearch / WebFetch stay disallowed even when the context pool
+# is mounted. Open-web access goes exclusively through mcp__ctx__web_search /
+# mcp__ctx__web_fetch, which are cached (deterministic eval replay), counted
+# against BOUNCE_CTX_BUDGET, SSRF-guarded, and can only ever mint `lead` nodes.
+# The native tools would bypass all four properties.
 _DISALLOWED_TOOLS = "Bash,Edit,Write,MultiEdit,Read,Glob,Grep,NotebookEdit,WebSearch,WebFetch,Task,TodoWrite"
 
 
@@ -2531,6 +2926,39 @@ def build_allowed_tools(pool: str) -> str:
     if pool == "cti":
         return _ALLOWED_TOOLS
     return _ALLOWED_TOOLS.replace("mcp__cti__", f"mcp__{pool}__")
+
+
+# Context-pool tools, appended only when the pool is mounted for the vertical.
+# Kept OUT of _ALLOWED_TOOLS so build_allowed_tools("cti") stays byte-identical
+# to the historical whitelist (roadmap invariant 4.4 / test_verticals) and a
+# vertical without the context pool sees no lead surface at all.
+_CTX_ALLOWED_TOOLS = (
+    "mcp__ctx__recall_prior_knowledge,mcp__ctx__web_search,"
+    "mcp__ctx__web_fetch,mcp__ctx__context_budget,"
+    "mcp__graph__corroborate_lead,mcp__graph__lead_status"
+)
+
+
+def _context_pool_on(inv_id: str, vertical: "verticals.Vertical") -> bool:
+    """Is the context pool mounted for THIS investigation? The vertical's
+    policy (``BOUNCE_CTX_ENABLED``), or the investigation's own admin opt-in
+    (``investigations.context_pool``). The MCP config, the tool whitelist, the
+    system prompt and the corroboration phase all ask here, so they can never
+    disagree about one investigation."""
+    return context_pool.context_pool_enabled(vertical.name,
+                                             forced=gs.get_context_pool(inv_id))
+
+
+def build_allowed_tools_for(vertical: "verticals.Vertical",
+                            ctx: Optional[bool] = None) -> str:
+    """Full --allowedTools whitelist for a vertical: its source pool, plus the
+    context pool when it is mounted (``ctx``; None = the vertical's policy)."""
+    tools = build_allowed_tools(vertical.source_pool)
+    if ctx is None:
+        ctx = context_pool.context_pool_enabled(vertical.name)
+    if ctx:
+        tools = tools + "," + _CTX_ALLOWED_TOOLS
+    return tools
 
 
 def _build_env(inv_id: str) -> dict:
@@ -2592,7 +3020,97 @@ def _build_env(inv_id: str) -> dict:
     return env
 
 
-def build_system_prompt(template: str, vertical: "verticals.Vertical") -> str:
+_CORROBORATE_SYSTEM_PROMPT = """You are Bounce-CTI, running a single focused phase: \
+LEAD CORROBORATION. Do not investigate anything new.
+
+Earlier in this investigation you recorded `lead` nodes — claims that came from your
+own prior knowledge or from open-web text, not from a source tool. They are stored
+with confidence <= 0.35, tagged `unverified`, and are EXCLUDED from every export.
+Your only job now is to resolve them.
+
+For EACH pending lead:
+  1. Read its `verifiable_by` and `falsifier` fields (lead_status() returns them).
+  2. Call the primary source tool(s) that would confirm or kill it. One or two
+     calls per lead — this phase is not a new investigation.
+  3. Call mcp__graph__corroborate_lead(lead_value=<the lead's value>,
+     verdict=..., evidence_tool=..., evidence_value=..., note=...):
+       - "corroborated"  a source tool independently confirms it. Pass the tool
+                         name and the exact value it returned. If the claim
+                         asserts a concrete indicator, ALSO pass
+                         promote_as_type / promote_as_value to create the real
+                         typed node.
+       - "refuted"       a source contradicts it. This is a SUCCESS, not a
+                         failure: record it plainly.
+       - "unverifiable"  no available source can test it either way. Honest and
+                         acceptable. Do not stretch to corroborate.
+
+HARD RULES:
+  - A lead may NOT be corroborated by another mcp__ctx__* call. Memory cannot
+    corroborate memory; the tool will reject it.
+  - Do NOT invent evidence values. evidence_value must be something a tool
+    actually returned in this phase.
+  - Prefer "refuted"/"unverifiable" over a weak "corroborated". A false
+    corroboration is the single worst outcome of this phase: it launders a guess
+    into an exportable, actionable indicator.
+  - Do not create a new report node here.
+
+Finish by calling mcp__graph__lead_status() one last time so the final
+corroboration counts are recorded.
+"""
+
+
+# Turn budget for the corroboration phase. Deliberately small: each lead needs
+# ~1 source call + 1 corroborate_lead call, and this phase must never become a
+# second investigation.
+CORROBORATE_MAX_TURNS = int(os.environ.get("BOUNCE_CORROBORATE_MAX_TURNS", "30"))
+
+
+async def _phase_corroborate_leads(inv_id: str, model: str, env: dict,
+                                   mcp_cfg_path: Path) -> Optional[dict]:
+    """Resolve every outstanding context-pool lead. No-op when the pool is off
+    for this vertical or nothing is pending. Returns the phase's quota dict."""
+    vertical = verticals.get_vertical(gs.get_vertical(inv_id))
+    if not _context_pool_on(inv_id, vertical):
+        return None
+
+    leads = gs.list_nodes_of_type(inv_id, context_pool.LEAD_NODE_TYPE)
+    resolved = {context_pool.TAG_CORROBORATED, context_pool.TAG_REFUTED,
+                context_pool.TAG_UNVERIFIABLE}
+    pending = [n for n in leads if not (set(n.get("tags") or []) & resolved)]
+    if not pending:
+        _log(inv_id, "phase_corroborate_leads_skipped",
+             {"reason": "no pending leads", "total_leads": len(leads)})
+        return None
+
+    lines = []
+    for n in pending[:25]:
+        md = n.get("metadata") or {}
+        lines.append(
+            f"- lead_value: {n['value']!r}\n"
+            f"    subject: {md.get('subject')}\n"
+            f"    claim_type: {md.get('claim_type')}\n"
+            f"    verifiable_by: {md.get('verifiable_by')}\n"
+            f"    falsifier: {md.get('falsifier')}"
+        )
+    prompt = (
+        f"{len(pending)} lead(s) are still unverified. Resolve them now, "
+        "one corroborate_lead call each:\n\n" + "\n".join(lines) +
+        "\n\nStart by calling mcp__graph__lead_status() to confirm the list."
+    )
+
+    _log(inv_id, "phase_corroborate_leads_starting", {"pending": len(pending)})
+    rc, saw, _, quota = await _run_claude_phase(
+        inv_id, prompt, _CORROBORATE_SYSTEM_PROMPT, model, env, mcp_cfg_path,
+        phase="corroborate_leads", max_turns=CORROBORATE_MAX_TURNS,
+    )
+    after = gs.list_nodes_of_type(inv_id, context_pool.LEAD_NODE_TYPE)
+    stats = context_pool.corroboration_stats(after)
+    _log(inv_id, "phase_corroborate_leads_done", {"rc": rc, "saw_result": saw, **stats})
+    return quota
+
+
+def build_system_prompt(template: str, vertical: "verticals.Vertical",
+                        ctx: Optional[bool] = None) -> str:
     """Compose a phase system prompt from the shared {core} template and the
     {vertical}: substitute the agent identity name and append the vertical's
     prompt block.
@@ -2600,13 +3118,24 @@ def build_system_prompt(template: str, vertical: "verticals.Vertical") -> str:
     The {core} templates (SYSTEM_PROMPT, _FOLLOWUP_SYSTEM_PROMPT, …) are written
     in the CTI voice ("You are Bounce-CTI"). For a non-CTI vertical the agent
     name is swapped throughout and the vertical's own prompt_block is appended.
-    For CTI (agent_name='Bounce-CTI', prompt_block='') this returns the template
-    byte-for-byte (roadmap invariant 4.4)."""
+    When the context pool is mounted for this vertical, the lead-discipline block
+    is appended too — so the rules governing prior knowledge / open-web material
+    arrive together with the tools that produce it, and are absent when they
+    aren't mounted.
+
+    ``ctx`` says whether the pool is mounted for this investigation (None = the
+    vertical's policy). For CTI (agent_name='Bounce-CTI', prompt_block='',
+    context pool off by default) this returns the template byte-for-byte
+    (roadmap invariant 4.4)."""
     out = template
     if vertical.agent_name != "Bounce-CTI":
         out = out.replace("Bounce-CTI", vertical.agent_name)
     if vertical.prompt_block:
         out = out + "\n\n" + vertical.prompt_block
+    if ctx is None:
+        ctx = context_pool.context_pool_enabled(vertical.name)
+    if ctx:
+        out = out + "\n\n" + verticals.CONTEXT_POOL_PROMPT_BLOCK
     return out
 
 
@@ -2619,14 +3148,20 @@ async def _run_claude_phase(inv_id: str, prompt: str, system_prompt: str,
     {"hit": bool, "reset_at": float|None, "message": str} — when hit is True
     the Claude subscription was exhausted; callers should abort downstream
     phases and surface a resume affordance to the user."""
+    if _stopped_by_user(inv_id):
+        # The run was stopped between two phases: no new process. The caller's
+        # _halt_on_user_stop ends the run on this return.
+        _log(inv_id, f"phase_{phase}_not_started", {"reason": "stopped_by_user"})
+        return (None, False, False, {"hit": False, "reset_at": None, "message": ""})
     claude_path = _resolve_claude_bin()
     # Resolve this investigation's vertical once and use it for both the
     # {core}+{vertical} system prompt and the per-pool tool whitelist (no-op for
     # CTI and OSINT-v1, which both use the cti source pool — see
     # build_system_prompt / build_allowed_tools).
     vertical = verticals.get_vertical(gs.get_vertical(inv_id))
-    system_prompt = build_system_prompt(system_prompt, vertical)
-    allowed_tools = build_allowed_tools(vertical.source_pool)
+    ctx = _context_pool_on(inv_id, vertical)
+    system_prompt = build_system_prompt(system_prompt, vertical, ctx)
+    allowed_tools = build_allowed_tools_for(vertical, ctx)
     _log(inv_id, f"phase_{phase}_starting", {"prompt_preview": prompt[:200]})
 
     cmd = [
@@ -2669,6 +3204,10 @@ async def _run_claude_phase(inv_id: str, prompt: str, system_prompt: str,
         return (None, False, False, {"hit": False, "reset_at": None, "message": ""})
 
     _running_procs[inv_id] = proc
+    # A stop that came while the process was being spawned found nothing to
+    # kill (see stop_investigation for why this read cannot miss it).
+    if _stopped_by_user(inv_id):
+        _kill_process(proc)
 
     quota_state = {"hit": False, "reset_at": None, "message": ""}
 
@@ -2713,9 +3252,21 @@ async def _run_claude_phase(inv_id: str, prompt: str, system_prompt: str,
         except Exception:
             pass
 
+    def _note_model(msg: str, source: str):
+        # No kill: the CLI exits on its own right after this error.
+        if inv_id in _model_unsupported:
+            return
+        cli_model = _MODEL_ALIASES.get(model, model)
+        _model_unsupported[inv_id] = f"model {model!r} ({cli_model}): {(msg or '')[:300]}"
+        _log(inv_id, "agent_model_unsupported", {
+            "phase": phase, "source": source, "model": model, "cli_model": cli_model,
+            "message": (msg or "")[:300],
+            "hint": "the host claude CLI is older than this model — update it, or pick another model",
+        })
+
     async def pump_stderr():
         assert proc.stderr is not None
-        async for line in proc.stderr:
+        async for line, _size in _iter_stream_lines(proc.stderr):
             decoded = line.decode(errors="replace").rstrip()
             _log(inv_id, "agent_stderr", decoded)
             hit, reset_at, marker = _detect_quota_error(decoded)
@@ -2723,13 +3274,21 @@ async def _run_claude_phase(inv_id: str, prompt: str, system_prompt: str,
                 _note_quota(True, reset_at, marker or decoded, "stderr")
             elif _detect_auth_error(decoded):
                 _note_auth(decoded, "stderr")
+            elif _detect_model_unsupported(decoded):
+                _note_model(decoded, "stderr")
 
     saw_result = {"v": False}
     first_event = {"seen": False}
 
     async def pump_stdout():
         assert proc.stdout is not None
-        async for line in proc.stdout:
+        async for line, size in _iter_stream_lines(proc.stdout):
+            if size > len(line):
+                first_event["seen"] = True
+                _log(inv_id, "agent_stdout_oversize", {
+                    "phase": phase, "bytes": size, "kept": len(line),
+                    "head": line[:2000].decode(errors="replace")})
+                continue
             text = line.decode(errors="replace").strip()
             if not text:
                 continue
@@ -2744,6 +3303,9 @@ async def _run_claude_phase(inv_id: str, prompt: str, system_prompt: str,
                     _note_quota(True, reset_at, marker, "stream")
                 elif _detect_auth_error(text):
                     _note_auth(text[:300], "stream")
+                elif (evt.get("type") == "result" and evt.get("is_error")
+                      and _detect_model_unsupported(str(evt.get("result") or ""))):
+                    _note_model(str(evt.get("result")), "stream")
             except Exception:
                 _log(inv_id, "agent_stdout", text[:2000])
                 hit, reset_at, marker = _detect_quota_error(text)
@@ -2814,12 +3376,19 @@ async def _run_claude_phase(inv_id: str, prompt: str, system_prompt: str,
                 try: proc.kill()
                 except Exception: pass
                 return
-            await asyncio.sleep(10)
+            await asyncio.sleep(_WATCHDOG_POLL_S)
 
     rc = None
     try:
-        await asyncio.gather(pump_stdout(), pump_stderr(), watchdog(),
-                             return_exceptions=True)
+        outcomes = await asyncio.gather(pump_stdout(), pump_stderr(), watchdog(),
+                                        return_exceptions=True)
+        # return_exceptions keeps one failure from cancelling the others, but it
+        # also hid a dead pump: the phase went on unlogged and nothing said so.
+        for name, outcome in zip(("stdout", "stderr", "watchdog"), outcomes):
+            if isinstance(outcome, BaseException):
+                _log(inv_id, "agent_stream_error", {
+                    "phase": phase, "stream": name,
+                    "error": f"{type(outcome).__name__}: {outcome}"[:300]})
         try:
             rc = await asyncio.wait_for(proc.wait(), timeout=10)
         except asyncio.TimeoutError:
@@ -2837,7 +3406,10 @@ async def _run_claude_phase(inv_id: str, prompt: str, system_prompt: str,
     except Exception:
         has_report = False
 
-    _running_procs.pop(inv_id, None)
+    # Only our own entry: after a stop then a rerun, the slot may already hold
+    # the new run's process, which the next stop must still find.
+    if _running_procs.get(inv_id) is proc:
+        _running_procs.pop(inv_id, None)
     _log(inv_id, f"phase_{phase}_exit", {
         "rc": rc, "saw_result": saw_result["v"], "has_report": has_report,
         "quota_hit": quota_state["hit"],
@@ -2940,7 +3512,8 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
     ground truth for relationships / attribution and to encode them as
     edges and tags rather than inventing them.
     """
-    _auth_failed.pop(inv_id, None)  # clear any stale auth flag from a prior run
+    _begin_run(inv_id)
+    _clear_ops_errors(inv_id)  # stale auth / model flags from a prior run
     user_prompt = seeds.investigation_prompt(seed_type, seed_value)
 
     # If we got a CTI report PDF, prepend its text as ground truth context.
@@ -2993,15 +3566,17 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
         inv_id, user_prompt, SYSTEM_PROMPT, model, env, mcp_cfg_path,
         phase="main"
     )
+    if _halt_on_user_stop(inv_id, rc, during="main"):
+        return
 
     if quota["hit"]:
         _finalise_quota_halt(inv_id, quota)
         return
 
-    # Auth failure (expired/invalid CLI credential): every phase will 401, so
-    # abort now and fail LOUD instead of grinding empty phases to a silent `done`.
-    if _auth_failed.get(inv_id):
-        _finalise_auth_halt(inv_id, _auth_failed[inv_id])
+    # Auth failure (expired/invalid CLI credential) or a model the CLI cannot
+    # run: every phase would fail the same way, so abort now and fail LOUD
+    # instead of grinding empty phases to a silent `done`.
+    if _halt_on_ops_error(inv_id):
         return
 
     phase1_ok = saw_result or has_report or rc == 0
@@ -3072,6 +3647,8 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
                 inv_id, hypothesis_prompt, _HYPOTHESIS_SYSTEM_PROMPT, model,
                 env, mcp_cfg_path, phase="hypothesis_write", max_turns=8,
             )
+            if _halt_on_user_stop(inv_id, rc_h, during="hypothesis_write"):
+                return
             _log(inv_id, "phase_hypothesis_write_done", {
                 "rc": rc_h, "saw_result": saw_h,
                 "wh_present_after": _has_working_hypothesis(),
@@ -3245,7 +3822,7 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
                     "url-path-template is a CLUSTER-EXPANSION pivot. For each one:\n"
                     "    1) urlscan_search(\"page.title:\\\"<title>\\\"\", size=200) — siblings using the same kit template\n"
                     "    2) urlscan_search(\"page.url:/<distinctive-path>/\") — siblings using the same URL path\n"
-                    "    3) shodan_search(\"http.favicon.hash:<hash>\") + netlas_favicon + zoomeye_favicon\n"
+                    "    3) shodan_host_count(\"http.favicon.hash:<hash>\") + netlas_favicon + zoomeye_favicon\n"
                     "  After EACH urlscan/shodan/netlas hit list, add EVERY distinct sibling domain "
                     "or IP as a node with a same_template/same_favicon/same_jarm edge. Do NOT "
                     "summarise the cluster in prose — graph every member.\n"
@@ -3279,6 +3856,8 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
                 inv_id, followup_prompt, _FOLLOWUP_SYSTEM_PROMPT, model, env,
                 mcp_cfg_path, phase="followup", max_turns=60
             )
+            if _halt_on_user_stop(inv_id, rc2, during="followup"):
+                return
             _log(inv_id, "phase2_done", {"rc": rc2, "saw_result": saw2})
             if quota2["hit"]:
                 _finalise_quota_halt(inv_id, quota2)
@@ -3289,6 +3868,26 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
             still_missing = _missing_mandatory_tools(seed_type, seed_value, called_after)
             if still_missing:
                 _log(inv_id, "phase2_incomplete", {"still_missing": still_missing})
+
+    # ── Phase 2b: Lead corroboration ──
+    # Every context-pool input (prior knowledge / open web) landed as an
+    # `unverified` lead. This phase exists because the whole value of the tier is
+    # the verification step, and an agent that has just written a plausible-
+    # sounding claim has no incentive to go kill it. Running corroboration as its
+    # own phase — BEFORE the report is written — means the report describes leads
+    # by their verdict rather than asserting them, and the corroboration rate
+    # becomes a real per-run measurement instead of an aspiration.
+    if not _is_parked(inv_id):
+        try:
+            quota_c = await _phase_corroborate_leads(
+                inv_id, model, env, mcp_cfg_path)
+            if _halt_on_user_stop(inv_id, during="corroborate_leads"):
+                return
+            if quota_c and quota_c.get("hit"):
+                _finalise_quota_halt(inv_id, quota_c)
+                return
+        except Exception as e:
+            _log(inv_id, "phase_corroborate_leads_error", {"error": str(e)[:300]})
 
     # ── Phase 3: Report-write fallback ──
     # If after main (+ optional followup) no investigation_summary report node
@@ -3406,6 +4005,8 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
                 inv_id, report_prompt, _FOLLOWUP_SYSTEM_PROMPT, model, env,
                 mcp_cfg_path, phase="report_write", max_turns=6,
             )
+            if _halt_on_user_stop(inv_id, rc3, during="report_write"):
+                return
             _log(inv_id, "phase3_report_write_done", {
                 "rc": rc3, "saw_result": saw3,
                 "report_written": _has_investigation_summary(),
@@ -3454,9 +4055,34 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
     # turns to make a meaningful dent, and avoids a multi-call overshoot landing
     # us above 90.
     PIVOT_DRAIN_MIN_HEADROOM = 8
+    # A CTI seed the investigation itself concluded legitimate is not drained:
+    # the drain chases the abuse a shared service hosts (CDN, SaaS) into
+    # clusters that have nothing to do with the seed (see _concluded_benign).
+    # The analyst can still pivot by hand. CTI only: in osint/dd a legitimate
+    # subject is the normal case and the drain is what finds its accounts and
+    # subsidiaries (replayed on production: osint 22→49, dd 37→56 nodes, none
+    # of them malicious). BOUNCE_PIVOT_DRAIN_ON_BENIGN=1 restores the drain.
+    PIVOT_DRAIN_ON_BENIGN = os.environ.get("BOUNCE_PIVOT_DRAIN_ON_BENIGN", "0") == "1"
 
-    if (phase1_ok and not _is_parked(inv_id)
-            and PIVOT_DRAIN_MAX_ROUNDS > 0):
+    drain_eligible = (phase1_ok and not _is_parked(inv_id)
+                      and PIVOT_DRAIN_MAX_ROUNDS > 0)
+    benign_verdict = None
+    if drain_eligible and not PIVOT_DRAIN_ON_BENIGN:
+        try:
+            if verticals.get_vertical(gs.get_vertical(inv_id)).name == "cti":
+                benign_verdict = _concluded_benign(
+                    gs.get_graph(inv_id).get("nodes", []))
+        except Exception as e:
+            # Fail open (the drain runs, as before the gate), but say so: a
+            # gate that silently stops working looks exactly like one that
+            # found no benign verdict.
+            benign_verdict = None
+            _log(inv_id, "phase_pivot_drain_gate_error", {"error": str(e)[:300]})
+        if benign_verdict:
+            _log(inv_id, "phase_pivot_drain_skipped",
+                 {"reason": "concluded_benign", **benign_verdict})
+
+    if drain_eligible and not benign_verdict:
         _log(inv_id, "phase_pivot_drain_starting", {
             "max_rounds": PIVOT_DRAIN_MAX_ROUNDS,
             "max_turns_per_round": PIVOT_DRAIN_MAX_TURNS,
@@ -3549,8 +4175,8 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
                 f"shodan_host+threatfox_search; domain → rdap_domain+"
                 f"virustotal_domain+threatfox_search+otx_domain+onyphe_domain; "
                 f"cert with serial → certspotter_serial+crtsh_serial; "
-                f"jarm → shodan_search+onyphe_datascan+netlas_jarm+zoomeye_jarm+"
-                f"urlscan_search('hash:<jarm>'); favicon_hash → shodan_search("
+                f"jarm → shodan_host_count+onyphe_datascan+netlas_jarm+zoomeye_jarm+"
+                f"urlscan_search('hash:<jarm>'); favicon_hash → shodan_host_count("
                 f"'http.favicon.hash:<h>')+netlas_favicon+zoomeye_favicon+"
                 f"onyphe_datascan('favicon:<h>'); title_hash → urlscan_search("
                 f"'page.title:\"<title>\"', size=200) for kit-template siblings.\n"
@@ -3579,6 +4205,8 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
                     mcp_cfg_path, phase=f"pivot_drain_{round_idx + 1}",
                     max_turns=round_turns,
                 )
+                if _halt_on_user_stop(inv_id, rc4, during=f"pivot_drain_{round_idx + 1}"):
+                    return
                 if quota4["hit"]:
                     _finalise_quota_halt(inv_id, quota4)
                     return
@@ -3636,6 +4264,8 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
                 model, env, mcp_cfg_path, phase="lessons_learned",
                 max_turns=6,
             )
+            if _halt_on_user_stop(inv_id, rc_l, during="lessons_learned"):
+                return
             _log(inv_id, "phase_lessons_learned_done", {
                 "rc": rc_l, "saw_result": saw_l,
                 "ll_present_after": _has_lessons_learned(inv_id),
@@ -3656,10 +4286,13 @@ async def run_investigation(inv_id: str, seed_type: str, seed_value: str, model:
         _log(inv_id, "dd_sanctions_sweep_error", {"error": str(e)[:200]})
 
     # ── Final status ──
+    # A stop that found no phase in flight (the DD sweep, the gap between two
+    # phases) ends here, before the status is written.
+    if _halt_on_user_stop(inv_id, rc):
+        return
     # Auth failure can surface in a later phase too — never report a 401-riddled
     # run as `done`.
-    if _auth_failed.get(inv_id):
-        _finalise_auth_halt(inv_id, _auth_failed[inv_id])
+    if _halt_on_ops_error(inv_id):
         return
 
     try:
@@ -3851,6 +4484,7 @@ async def run_add_seed(inv_id: str, seed_type: str, seed_value: str, model: str 
     the report in place with per-seed summaries and explicit cross-seed
     findings (or an empty list, if nothing is shared).
     """
+    _begin_run(inv_id)
     user_prompt = (
         f"Add new PEER seed: type={seed_type} value={seed_value}\n"
         f"Investigation id: {inv_id}\n\n"
@@ -3896,13 +4530,18 @@ async def run_add_seed(inv_id: str, seed_type: str, seed_value: str, model: str 
         _finalise_quota_halt(inv_id, {"reset_at": reset_at, "message": msg})
         return
 
+    _clear_ops_errors(inv_id)
     rc, saw_result, has_report, quota = await _run_claude_phase(
         inv_id, user_prompt, _ADD_SEED_SYSTEM_PROMPT, model, env, mcp_cfg_path,
         phase="add_seed", max_turns=80,
     )
+    if _halt_on_user_stop(inv_id, rc, phase="add_seed"):
+        return
 
     if quota["hit"]:
         _finalise_quota_halt(inv_id, quota)
+        return
+    if _halt_on_ops_error(inv_id):
         return
 
     final_status = "done" if (saw_result or rc == 0) else f"error rc={rc}"
@@ -3921,6 +4560,7 @@ async def run_pivot(inv_id: str, seed_type: str, seed_value: str, model: str = "
     by the API endpoint, and this function emits agent_exit on completion so
     the frontend sidebar refreshes live.
     """
+    _begin_run(inv_id)
     user_prompt = (
         f"Pivot seed: type={seed_type} value={seed_value}\n"
         f"Investigation id: {inv_id}\n\n"
@@ -3953,13 +4593,18 @@ async def run_pivot(inv_id: str, seed_type: str, seed_value: str, model: str = "
         _finalise_quota_halt(inv_id, {"reset_at": reset_at, "message": msg})
         return
 
+    _clear_ops_errors(inv_id)
     rc, saw_result, has_report, quota = await _run_claude_phase(
         inv_id, user_prompt, _PIVOT_SYSTEM_PROMPT, model, env, mcp_cfg_path,
         phase="pivot", max_turns=40
     )
+    if _halt_on_user_stop(inv_id, rc, phase="pivot"):
+        return
 
     if quota["hit"]:
         _finalise_quota_halt(inv_id, quota)
+        return
+    if _halt_on_ops_error(inv_id):
         return
 
     # Final status — pivot is considered successful as long as the agent ran
@@ -4025,6 +4670,7 @@ C5. After the report update, stop. Do not chain further actions beyond what was 
 async def run_custom_prompt(inv_id: str, prompt_text: str, model: str = "opus",
                             selected_nodes: list[dict] | None = None):
     """Run a custom analyst prompt on an existing investigation."""
+    _begin_run(inv_id)
     # Fetch existing graph to build context snapshot and conversation history.
     past_prompts: list = []
     graph_snapshot = ""
@@ -4140,13 +4786,18 @@ async def run_custom_prompt(inv_id: str, prompt_text: str, model: str = "opus",
         _finalise_quota_halt(inv_id, {"reset_at": reset_at, "message": msg})
         return
 
+    _clear_ops_errors(inv_id)
     rc, saw_result, has_report, quota = await _run_claude_phase(
         inv_id, user_prompt, _CUSTOM_PROMPT_SYSTEM_PROMPT, model, env, mcp_cfg_path,
         phase="custom_prompt", max_turns=60,
     )
+    if _halt_on_user_stop(inv_id, rc, phase="custom_prompt"):
+        return
 
     if quota["hit"]:
         _finalise_quota_halt(inv_id, quota)
+        return
+    if _halt_on_ops_error(inv_id):
         return
 
     final_status = "done" if (saw_result or rc == 0) else f"error rc={rc}"

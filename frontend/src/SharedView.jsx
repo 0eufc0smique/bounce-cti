@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react'
+import Icon from './components/Icon.jsx'
+import { readCanvasColors, edgeLabel } from './lib/graph.js'
 import cytoscape from 'cytoscape'
 import coseBilkent from 'cytoscape-cose-bilkent'
+import NodeProvenance from './components/NodeProvenance.jsx'
+import { useNodeTies } from './hooks/useNodeData.js'
 
 cytoscape.use(coseBilkent)
 
@@ -24,11 +28,43 @@ function iocString(v) {
   return String(v)
 }
 
+// Same rules as lib/graph.js (isAuxReportNode / toCyNodeData): the agent's internal
+// report nodes stay off the canvas, and a hash or command line is labelled by
+// its file name or preview rather than a truncated digest.
+function isAuxReportNode(n) {
+  if (!n || n.type !== 'report') return false
+  const v = String(n.value || '').toLowerCase()
+  return v.startsWith('working_hypothesis') || v.startsWith('budget_extension') || v === 'lessons_learned'
+}
+
+function displayValue(n) {
+  const md = n.metadata || {}
+  if (n.type === 'hash') {
+    const name = md.file_name || (Array.isArray(md.names) && md.names[0])
+      || (Array.isArray(md.file_names) && md.file_names[0]) || md.meaningful_name
+    return name ? String(name) : iocString(n.value).slice(0, 10) + '…'
+  }
+  if (n.type === 'command_line') {
+    const p = md.preview || md.file_name
+    return p ? String(p) : iocString(n.value).slice(0, 10) + '…'
+  }
+  return iocString(n.value)
+}
+
+const REPO_URL = 'https://github.com/Iskandeur/bounce-cti'
+
 // Read-only viewer for a shared investigation. Loads /api/share/<token>
 // (no auth required), renders the graph with cytoscape, surfaces the report
 // + timeline (only sections the share permits), and offers an Import button
 // that clones the graph into the recipient's account when they're logged in.
-export default function SharedView({ token }) {
+//
+// With `demoSrc` instead of `token` it is the static demo (frontend/demo/,
+// `npm run build:demo`): it loads a snapshot file written by
+// eval/demo_export.py, with no backend, no login and no import. `demoCases`
+// (every snapshot name of the build) and `demoCase` (the one shown) add a
+// case picker to the top bar when there is more than one.
+export default function SharedView({ token, demoSrc, demoCases = [], demoCase = '' }) {
+  const demo = Boolean(demoSrc)
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [me, setMe] = useState(undefined) // undefined = unknown, null = anon, obj = user
@@ -42,6 +78,19 @@ export default function SharedView({ token }) {
   const [myInvs, setMyInvs] = useState([])
   const cyRef = useRef(null)
   const containerRef = useRef(null)
+  // Edges touching the selected node, for the Node tab's provenance.
+  const ties = useNodeTies(cyRef, selected)
+  // Open a neighbour from the provenance: the same result as tapping it.
+  const openNode = (id) => {
+    const cy = cyRef.current
+    const node = cy ? cy.$id(id) : null
+    if (!node || !node.length) return
+    cy.nodes().unselect()
+    node.select()
+    cy.animate({ fit: { eles: node.closedNeighborhood(), padding: 80 }, duration: 400 })
+    setSelected(node.data())
+    setTab(node.data('type') === 'report' ? 'report' : 'node')
+  }
 
   // Fetch share + auth status in parallel. When authed, also pull the
   // recipient's investigations so we can offer 'merge into existing' as an
@@ -49,6 +98,15 @@ export default function SharedView({ token }) {
   // the receiver already has overlapping nodes in another graph.
   useEffect(() => {
     let cancel = false
+    if (demo) {
+      fetch(demoSrc)
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(snap => { if (!cancel) { setData(snap); setMe(null) } })
+        .catch(e => {
+          if (!cancel) setErr(typeof e === 'number' ? `Snapshot not found (HTTP ${e})` : 'Could not load the snapshot')
+        })
+      return () => { cancel = true }
+    }
     Promise.all([
       fetch(`/api/share/${encodeURIComponent(token)}`).then(r => r.ok ? r.json() : Promise.reject(r.status)),
       fetch('/api/auth/me', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : null).catch(() => null),
@@ -64,14 +122,17 @@ export default function SharedView({ token }) {
       }
     }).catch((e) => {
       if (cancel) return
-      setErr(typeof e === 'number' ? `Lien introuvable, révoqué ou expiré (HTTP ${e})` : 'Erreur réseau')
+      setErr(typeof e === 'number' ? `Link not found, revoked or expired (HTTP ${e})` : 'Network error')
     })
     return () => { cancel = true }
-  }, [token])
+  }, [token, demoSrc])
 
   // Mount cytoscape once we have data.
   useEffect(() => {
     if (!data || !containerRef.current || cyRef.current) return
+    // Labels and default lines follow the theme, as on the main canvas. This
+    // view has no theme switch, so they are read once.
+    const canvas = readCanvasColors()
     cyRef.current = cytoscape({
       container: containerRef.current,
       style: [
@@ -81,19 +142,19 @@ export default function SharedView({ token }) {
             'background-color': ele => NODE_COLORS[ele.data('type')] || '#8b949e',
             'shape': ele => NODE_SHAPES[ele.data('type')] || 'ellipse',
             'label': 'data(label)',
-            'color': '#e6edf3',
+            'color': canvas.text,
             'font-size': 10,
             'text-valign': 'bottom',
             'text-margin-y': 5,
             'width': ele => ele.data('type') === 'report' ? 38 : 22,
             'height': ele => ele.data('type') === 'report' ? 38 : 22,
             'border-width': 2,
-            'border-color': '#30363d',
+            'border-color': canvas.line,
           },
         },
         {
           selector: 'node[?seed]',
-          style: { 'width': 32, 'height': 32, 'border-width': 3, 'border-color': '#f0f6fc', 'font-weight': 'bold' },
+          style: { 'width': 32, 'height': 32, 'border-width': 3, 'border-color': canvas.text, 'font-weight': 'bold' },
         },
         {
           selector: 'node[type="report"][value="investigation_summary"]',
@@ -105,21 +166,21 @@ export default function SharedView({ token }) {
         },
         {
           selector: 'node:selected',
-          style: { 'border-color': '#ffffff', 'border-width': 4 },
+          style: { 'border-color': canvas.text, 'border-width': 4 },
         },
         {
           selector: 'edge',
           style: {
             'width': 1.5,
-            'line-color': '#30363d',
-            'target-arrow-color': '#30363d',
+            'line-color': canvas.line,
+            'target-arrow-color': canvas.line,
             'target-arrow-shape': 'triangle',
             'curve-style': 'bezier',
-            'label': ele => ele.data('relation') || '',
+            'label': edgeLabel,
             'font-size': 8,
-            'color': '#8b949e',
+            'color': canvas.dimText,
             'text-rotation': 'autorotate',
-            'text-background-color': '#0d1117',
+            'text-background-color': canvas.canvas,
             'text-background-opacity': 1,
             'text-background-padding': 2,
           },
@@ -141,21 +202,25 @@ export default function SharedView({ token }) {
       },
     })
 
-    // Hydrate elements from the payload.
-    const nodes = data.graph.nodes.map(n => {
+    // Hydrate elements from the payload. An edge whose end is not drawn (an
+    // aux report node, or a report node left out of the share) is dropped:
+    // cytoscape refuses an edge to a missing node.
+    const shown = data.graph.nodes.filter(n => !isAuxReportNode(n))
+    const shownIds = new Set(shown.map(n => n.id))
+    const nodes = shown.map(n => {
       const isSeed = (n.tags || []).includes('seed')
       const isReportSummary = n.type === 'report' && n.value === 'investigation_summary'
-      const displayValue = iocString(n.value)
+      const shownValue = displayValue(n)
       const label = isReportSummary
         ? 'Investigation Summary'
-        : (displayValue.length > 30 ? displayValue.slice(0, 28) + '…' : displayValue)
+        : (shownValue.length > 30 ? shownValue.slice(0, 28) + '…' : shownValue)
       const d = { id: n.id, type: n.type, label, value: n.value,
         metadata: n.metadata, tags: n.tags, source: n.source, confidence: n.confidence,
         created_at: n.created_at }
       if (isSeed) d.seed = true
       return { group: 'nodes', data: d }
     })
-    const edges = data.graph.edges.map(e => ({
+    const edges = data.graph.edges.filter(e => shownIds.has(e.src) && shownIds.has(e.dst)).map(e => ({
       group: 'edges',
       data: { id: e.id, source: e.src, target: e.dst, relation: e.relation, evidence: e.evidence },
     }))
@@ -209,13 +274,13 @@ export default function SharedView({ token }) {
       })
       if (!r.ok) {
         const t = await r.text()
-        alert(`Import a échoué: ${t || r.status}`)
+        alert(`Import failed: ${t || r.status}`)
         return
       }
       const d = await r.json()
       if (d.mode === 'merge') {
         // Friendly counters so the analyst sees what landed in their graph.
-        const summary = `Merge OK — +${d.nodes_added} nouveau(x), ${d.nodes_merged} dédupliqué(s), ${d.edges_added} edge(s).`
+        const summary = `Merge OK — +${d.nodes_added} new, ${d.nodes_merged} deduped, ${d.edges_added} edge(s).`
         try { console.log(summary) } catch (_) {}
       }
       window.location.href = `/?inv=${encodeURIComponent(d.id)}`
@@ -230,10 +295,10 @@ export default function SharedView({ token }) {
         <div className="auth-card">
           <span className="logo-mark logo-mark-auth" role="img" aria-label="Bounce-CTI" />
           <div className="logo">BOUNCE<span>CTI</span></div>
-          <div className="auth-label">Lien partagé</div>
+          <div className="auth-label">{demo ? 'Demo' : 'Shared link'}</div>
           <div className="auth-error">{err}</div>
-          <a href="/" className="auth-btn secondary" style={{ textAlign: 'center', textDecoration: 'none' }}>
-            ← Retour à Bounce-CTI
+          <a href={demo ? REPO_URL : '/'} className="auth-btn secondary" style={{ textAlign: 'center', textDecoration: 'none' }}>
+            {demo ? <><Icon name="external" />Bounce-CTI on GitHub</> : 'Back to Bounce-CTI'}
           </a>
         </div>
       </div>
@@ -245,7 +310,7 @@ export default function SharedView({ token }) {
       <div className="auth-screen">
         <div className="auth-card">
           <div className="logo">BOUNCE<span>CTI</span></div>
-          <div className="auth-label">Chargement du graphe partagé…</div>
+          <div className="auth-label">{demo ? 'Loading the investigation…' : 'Loading the shared graph…'}</div>
         </div>
       </div>
     )
@@ -256,6 +321,8 @@ export default function SharedView({ token }) {
   const reportNode = data.graph.nodes.find(n => n.type === 'report' && n.value === 'investigation_summary')
   const report = reportNode?.metadata || null
   const events = data.events || []
+  const demoMeta = demo ? (data.share.demo || {}) : null
+  const runDate = inv.created_at ? new Date(inv.created_at * 1000).toISOString().slice(0, 10) : ''
 
   return (
     <div className="shared-view">
@@ -264,34 +331,55 @@ export default function SharedView({ token }) {
           <span className="logo-mark logo-mark-sidebar" aria-hidden="true" />
           <div>
             <div className="shared-title">
-              <span className="shared-badge">PARTAGÉ</span>
+              <span className="shared-badge">{demo ? 'DEMO' : 'SHARED'}</span>
               <span className="shared-seed">
                 <span className="inv-type">{inv.seed_type}</span> {inv.seed_value}
               </span>
             </div>
             <div className="shared-subtitle">
-              {sections.filter(s => s !== 'graph').join(' · ')} · lecture seule
+              {demo
+                ? [demoMeta.label, runDate && `run ${runDate}`, demoMeta.model,
+                   'autonomous agent, public CTI sources, read-only snapshot'].filter(Boolean).join(' · ')
+                : `${sections.filter(s => s !== 'graph').join(' · ')} · read-only`}
             </div>
           </div>
         </div>
         <div className="shared-topbar-right">
+          {demo && demoCases.length > 1 && (
+            <select
+              className="shared-import-target"
+              value={demoCase}
+              onChange={e => { window.location.search = `?case=${encodeURIComponent(e.target.value)}` }}
+              title="Pick another frozen investigation"
+              aria-label="Demo case"
+            >
+              {demoCases.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          )}
+          {demo && (
+            <a className="auth-btn shared-import-btn" href={REPO_URL} style={{ textDecoration: 'none' }}>
+              <Icon name="external" />Code on GitHub
+            </a>
+          )}
           <button
             className="btn-sm secondary"
             onClick={() => setPanelOpen(v => !v)}
-            title="Toggle the side panel"
+            aria-pressed={panelOpen}
+            title={panelOpen ? 'Hide the side panel' : 'Show the side panel'}
           >
-            {panelOpen ? '▶ panneau' : '◀ panneau'}
+            <Icon name={panelOpen ? 'boxChecked' : 'box'} />Panel
           </button>
-          {me && myInvs.length > 0 && (
+          {!demo && me && myInvs.length > 0 && (
             <select
               className="shared-import-target"
               value={importTarget}
               onChange={e => setImportTarget(e.target.value)}
-              title="Choisir où atterrir : nouveau graphe ou merge dans une investigation existante"
+              title="Where the graph lands: a new investigation, or merged into one of yours"
+              aria-label="Import target"
               disabled={importBusy}
             >
-              <option value="">↪ Nouvelle investigation</option>
-              <optgroup label="Merger dans une investigation existante">
+              <option value="">New investigation</option>
+              <optgroup label="Merge into an existing investigation">
                 {myInvs.map(i => (
                   <option key={i.id} value={i.id}>
                     {i.seed_value.length > 36 ? i.seed_value.slice(0, 34) + '…' : i.seed_value}
@@ -301,24 +389,24 @@ export default function SharedView({ token }) {
               </optgroup>
             </select>
           )}
-          <button
+          {!demo && <button
             className="auth-btn shared-import-btn"
             disabled={importBusy}
             onClick={importToMyAccount}
             title={!me
-              ? 'Connectez-vous pour importer ce graphe'
+              ? 'Sign in to import this graph'
               : importTarget
-                ? 'Fusionner ce graphe dans l\'investigation choisie (dédupe par type+valeur)'
-                : 'Cloner ce graphe dans une nouvelle investigation'}
+                ? 'Merge this graph into the chosen investigation (deduplicated by type and value)'
+                : 'Clone this graph into a new investigation'}
           >
             {importBusy
-              ? 'Import…'
+              ? 'Importing…'
               : !me
-                ? 'Se connecter pour importer'
+                ? 'Sign in to import'
                 : importTarget
-                  ? '⤵ Merger ici'
-                  : '↓ Importer dans mon compte'}
-          </button>
+                  ? 'Merge here'
+                  : 'Import into my account'}
+          </button>}
         </div>
       </header>
 
@@ -339,15 +427,15 @@ export default function SharedView({ token }) {
           <aside className="shared-panel">
             <div className="panel-tabs">
               {sections.includes('report') && (
-                <button className={`panel-tab${tab === 'report' ? ' active' : ''}`} onClick={() => setTab('report')}>
-                  Rapport
+                <button className={`panel-tab${tab === 'report' ? ' active' : ''}`} aria-pressed={tab === 'report'} onClick={() => setTab('report')}>
+                  Report
                 </button>
               )}
-              <button className={`panel-tab${tab === 'node' ? ' active' : ''}`} onClick={() => setTab('node')}>
-                Nœud
+              <button className={`panel-tab${tab === 'node' ? ' active' : ''}`} aria-pressed={tab === 'node'} onClick={() => setTab('node')}>
+                Node
               </button>
               {sections.includes('timeline') && (
-                <button className={`panel-tab${tab === 'timeline' ? ' active' : ''}`} onClick={() => setTab('timeline')}>
+                <button className={`panel-tab${tab === 'timeline' ? ' active' : ''}`} aria-pressed={tab === 'timeline'} onClick={() => setTab('timeline')}>
                   Timeline
                 </button>
               )}
@@ -392,18 +480,18 @@ export default function SharedView({ token }) {
                     )}
                   </>
                 ) : (
-                  <p className="hint">Le rapport n’a pas été inclus dans ce partage.</p>
+                  <p className="hint">The report is not part of this share.</p>
                 )
               )}
               {tab === 'node' && (
                 selected ? (
                   <>
                     <div className="node-header">
-                      <span className="type-badge"
+                      <span className="type-badge type-ink"
                         style={{
+                          '--type': NODE_COLORS[selected.type] || '#8b949e',
                           background: (NODE_COLORS[selected.type] || '#8b949e') + '2a',
                           borderColor: NODE_COLORS[selected.type] || '#8b949e',
-                          color: NODE_COLORS[selected.type] || '#8b949e',
                         }}>
                         {selected.type}
                       </span>
@@ -416,13 +504,14 @@ export default function SharedView({ token }) {
                         ))}
                       </div>
                     )}
+                    <NodeProvenance key={selected.id} node={selected} ties={ties} onOpenNode={openNode} />
                     <div>
                       <div className="section-label" style={{ margin: '8px 0 6px' }}>Metadata</div>
                       <pre className="meta-pre">{JSON.stringify(selected.metadata, null, 2)}</pre>
                     </div>
                   </>
                 ) : (
-                  <p className="hint">Tapez un nœud du graphe pour l’inspecter.</p>
+                  <p className="hint">Click a node in the graph to inspect it.</p>
                 )
               )}
               {tab === 'timeline' && (() => {
@@ -463,7 +552,7 @@ export default function SharedView({ token }) {
                       }
                     }
                   } else if (evt.kind === 'agent_starting') {
-                    items.push({ kind: 'status', ts, tsStr, label: '▶ agent démarré' })
+                    items.push({ kind: 'status', ts, tsStr, label: '▶ agent started' })
                   } else if (evt.kind === 'agent_exit') {
                     const m = evt.msg || {}
                     const phase = m.phase || ''
@@ -473,15 +562,16 @@ export default function SharedView({ token }) {
                       label: phase ? `■ fin (${phase}) rc=${rc}` : `■ fin rc=${rc}`,
                     })
                   } else if (evt.kind === 'status_change') {
+                    // Written as {kind, status} by the backend; older rows nest it under msg.
                     const m = evt.msg || {}
-                    const status = (typeof m === 'string' ? m : (m.status || '')) || '?'
-                    items.push({ kind: 'status', ts, tsStr, label: `● statut : ${status}` })
+                    const status = (typeof m === 'string' ? m : (m.status || evt.status || '')) || '?'
+                    items.push({ kind: 'status', ts, tsStr, label: `● status: ${status}` })
                   } else if (evt.kind === 'node_tagged') {
                     items.push({ kind: 'tag', ts, tsStr, label: `+ tag ${evt.tag || ''}`.trim() })
                   }
                 }
                 if (items.length === 0) {
-                  return <p className="hint">Pas d’événement dans la timeline.</p>
+                  return <p className="hint">No event in the timeline.</p>
                 }
                 return (
                   <div className="timeline-list">

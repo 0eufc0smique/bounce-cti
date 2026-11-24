@@ -1,10 +1,10 @@
 # bounce-cti
 
-> **Copyright (c) 2026 Alexandre Pinoteau · All rights reserved.**
-> Source-available for personal study and non-commercial individual use.
-> Any organizational, institutional, governmental, or commercial use
-> requires a written license — see [LICENSE](./LICENSE) and
-> [COMMERCIAL.md](./COMMERCIAL.md).
+[![CI merge-gate](https://github.com/Iskandeur/bounce-cti/actions/workflows/ci.yml/badge.svg)](https://github.com/Iskandeur/bounce-cti/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+
+> **Copyright (c) 2026 Alexandre Pinoteau · Licensed under the
+> [Apache License 2.0](./LICENSE).**
 
 Autonomous CTI investigation tool. Feed it a domain, IP, file hash, URL, JARM
 fingerprint, ASN, malicious command line, or just the **filename** of a
@@ -15,16 +15,66 @@ Netlas, ZoomEye, CriminalIP, OTX, ThreatFox, AbuseIPDB, abuse.ch URLhaus &
 MalwareBazaar, Mnemonic pDNS, ip-api, Wayback, Whoxy reverse-WHOIS, OpenPhish,
 DOM fingerprints) building a live infrastructure graph in your browser.
 
+**At a glance**
+
+- **An agent that pivots, under rules it cannot talk its way out of.** Noise
+  (CDN ranges, parking, sinkholes) must be defused before a pivot; a global
+  call budget caps each run; the agent writes findings to the graph through
+  MCP tools only, never through prose.
+- **Facts and guesses kept apart.** What the model remembers or reads on the
+  web becomes a capped, dashed *lead* that a primary source must corroborate
+  before it counts, and that never reaches a blocklist or a STIX bundle.
+- **Measured, with its limits stated.** The same five real-world cases,
+  re-run after agent changes and published with what the numbers do not show
+  ([`EVAL_RESULTS.md`](./EVAL_RESULTS.md)); source answers can be recorded
+  and replayed offline (EVAL_PROTOCOL §4.C).
+- **Deliverables an analyst can use.** PDF report and STIX 2.1, plus
+  blocklists (hosts / RPZ / Palo Alto EDL / Cisco ACL…), Sigma / Snort / YARA
+  stubs and per-host takedown emails. Unverified leads never enter the
+  actionable ones, and defused indicators stay out of them by default.
+
+> **Status:** the OSINT and Due-Diligence (DD) verticals are experimental and
+> frozen: no further development is planned on them. Active work is on CTI.
+
+## Demo
+
+![Bounce-CTI: one IOC pasted, the graph builds itself, defused nodes greyed, a lead turns into a finding once a source corroborates it](media/demo.gif)
+
+One IOC pasted, CDN ranges and parked nameservers defused before the pivot, and
+a lead promoted to a finding only once a source corroborates it (a 15-second
+loop, no sound). The [20-second version with music](media/demo.mp4) opens as a
+file. Asset provenance and licenses: [`media/README.md`](media/README.md).
+
+**A whole investigation to click through, with no login.** `npm run build:demo`
+(in `frontend/`) builds a static, read-only page from the investigations frozen
+in [`eval/demo/`](eval/demo/README.md): the graph, the report and the agent's
+timeline, exactly as a share link shows them, with no backend and no API key.
+Serve the folder to open it, with no network:
+`python3 -m http.server 8000 --bind 127.0.0.1 --directory frontend/dist-demo`,
+then http://127.0.0.1:8000/. Opened straight from disk, the page cannot load and
+says so: browsers do not run its scripts on a `file://` address.
+
 ## Features
 
 - **Live graph**: Cytoscape canvas updated over WebSocket as the agent pivots.
+  Node types and edge relations can be filtered, defused nodes (CDN, parking,
+  sinkhole…) hidden with one toolbar toggle, and a legend lists the shapes and
+  borders the current graph uses.
+- **Run progress**: one line says which phase the agent is in, how long the run
+  has lasted and how many source calls it has made, against the pivot-drain
+  budget; a screen reader hears each phase change and the end of the run.
 - **PIN auth + admin dashboard**: per-user model whitelist, account labels,
   one-click impersonation. Admin PIN is bootstrapped from `ADMIN_PIN` env var
   on first start (see "First login" below).
-- **Model + thinking-effort selection**: pick the Claude model (Sonnet 4.6,
-  Opus 4.6 / 4.7 / 4.8, Haiku 4.5) and an extended-thinking effort level
-  (low → max, or the model default) per investigation. Admins gate which
-  models each user may spawn.
+- **Model + thinking-effort selection**: pick the Claude model (the current
+  Sonnet / Opus / Haiku, labelled with the version they run — Sonnet 5.5,
+  Opus 5, Haiku 5.5 — or a pinned Sonnet 5, Opus 5, Fable 5, Opus 4.8 or
+  Opus 4.7) and an extended-thinking effort level (low → max, or the model
+  default) per investigation. Admins gate which models each user may spawn.
+  A model the server's `claude` CLI is too old to run fails the investigation
+  at once as `error: model`, with what to update.
+  Fable 5's safety classifiers target offensive-cyber content, so
+  malware-heavy investigations may be refused on it; Opus 5 is the safer pick.
 - **Investigation vertical**: choose the lens for a new investigation — **CTI**
   (threat-infrastructure attribution, the default), **OSINT** (identity /
   entity footprint correlation), or **Due Diligence / KYB** (company identity +
@@ -50,11 +100,33 @@ DOM fingerprints) building a live infrastructure graph in your browser.
   (sanctions exposure, company identity, corporate hierarchy, officers/PSC).
 - **Mobile-friendly**: drawer layout, touch-sized targets, single-finger pan.
 - **Light / dark theme**: toggle in the sidebar header (☀ / ☾); the choice is
-  persisted per browser and applied before first paint.
+  persisted per browser and applied before first paint. The graph labels follow it.
 - **Custom prompts on top of an existing graph**: ask the agent to dig further
   with the current graph (and a selection) as context.
 - **Noise defusing**: built-in CDN ranges, parking nameservers, sinkhole IPs
   and DynDNS TLDs — agent must call `defuse()` before pivoting on infrastructure.
+- **Provenance of every node**: the Node tab says in plain text where a node
+  came from (the sources named when it was added and since, the date, the
+  confidence; a lead is called a hypothesis, with its verdict), lists the edges
+  that tie it to the graph with the reason written on those that carry one,
+  every neighbour one click away, and shows on demand the cached source answers
+  about that exact value. The share viewer and the static demo carry the first
+  two.
+- **Leads, separated from facts**: the agent can also draw on its own prior
+  knowledge and on the open web — useful for naming a campaign, routing a
+  company to the right registry, or connecting a handle to a public project,
+  none of which the source pool can answer. Because that material is
+  unverifiable at the point of production, it never enters the graph as a
+  finding: it becomes a **lead** (confidence capped at 0.35, tagged
+  `unverified`, dashed on the canvas) and is **excluded from every actionable
+  export** — blocklists, detection rules, takedown emails and STIX. A lead
+  becomes a real node only once a *primary* source tool corroborates it, and the
+  promoted node carries that tool as its provenance. `refuted` and
+  `unverifiable` are recorded as normal outcomes, and each investigation reports
+  a **corroboration rate** — how much of what the model proposed actually
+  survived contact with a source. Reports, dossiers and the PDF list leads under
+  their own clearly-labelled heading, never in the body. Enabled by default for
+  OSINT and Due Diligence; opt-in for CTI (`BOUNCE_CTX_ENABLED`).
 
 ## Architecture
 
@@ -73,6 +145,31 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full breakdown and
 [`PURPOSE.md`](./PURPOSE.md) for scope and intent.
 
 ## Setup
+
+### With Docker (one command)
+
+```bash
+cp .env.example .env   # set ADMIN_PIN and Claude auth; API keys optional (see below)
+docker compose up -d --build
+```
+
+Open **http://localhost:8001** and sign in with your `ADMIN_PIN`. The image
+builds the frontend, installs the backend and the `claude` CLI, and runs them
+as a non-root user. Claude auth inside the container comes from `.env`:
+`CLAUDE_CODE_OAUTH_TOKEN` (run `claude setup-token` wherever you are logged in
+to a Pro/Max plan) or `ANTHROPIC_API_KEY`.
+
+- `.env` is mounted read-only and never copied into the image; without it the
+  stack refuses to start. The database, cache and logs live in the
+  `bounce-data` volume (`docker compose down -v` deletes them).
+- The port is published on `127.0.0.1` only. The session cookie is `Secure`:
+  browsers accept it over `http://localhost`, not over plain HTTP on any other
+  address. To reach it from elsewhere, put HTTPS in front, as production does
+  (see [Deployment](#deployment)).
+- `CLAUDE_CODE_VERSION` (build argument, default `stable`) picks the CLI:
+  `docker compose build --build-arg CLAUDE_CODE_VERSION=latest`.
+
+### From source
 
 ```bash
 python -m venv .venv
@@ -104,7 +201,8 @@ Pulsedive, Censys, EmailRep, Project Honey Pot).
 VIRUSTOTAL_API_KEY=    # 4 req/min on free tier
 URLSCAN_API_KEY=       # free
 ONYPHE_API_KEY=        # free community tier
-SHODAN_API_KEY=        # paid; optional
+SHODAN_API_KEY=        # Membership; optional. Free endpoints only by default —
+                       # metered search is off unless BOUNCE_SHODAN_ALLOW_CREDITS=1
 OTX_API_KEY=           # free
 ABUSECH_AUTH_KEY=      # free, register at https://auth.abuse.ch/  (URLhaus + MalwareBazaar)
 
@@ -134,6 +232,14 @@ EMAILREP_API_KEY=        #  10/day anon  https://emailrep.io/key             (op
 # No-auth sources (no key needed): CIRCL hashlookup + vuln-lookup, AlienVault
 # reputation feed, PhishTank, Tor exit-relay list, dnstwist (local binary —
 # `pip install dnstwist`, already in requirements.txt).
+
+# Context pool (leads). No key required: `recall_prior_knowledge` needs no
+# network at all, and web search falls back to a keyless DuckDuckGo endpoint.
+BOUNCE_CTX_ENABLED=      # auto (default: OSINT+DD) | all | 0 | "osint,dd"
+BOUNCE_CTX_WEB=          # 0 = prior-knowledge only, no web (no injection surface)
+BOUNCE_CTX_BUDGET=       # context calls per investigation (default 12, 0 = unlimited)
+BRAVE_SEARCH_API_KEY=    # optional, preferred search backend
+SERPER_API_KEY=          # optional, second choice
 
 # Multi-key rotation (optional). Supersedes the single-key form per source.
 # VIRUSTOTAL_API_KEYS=k1,k2,k3
@@ -187,11 +293,15 @@ enforces this and adds an early-exit when a domain looks parked or sinkholed.
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md). Because
-Bounce-CTI is source-available and may also be offered commercially, your first
-pull request must sign the [Contributor License Agreement](./CLA.md) (handled
-automatically by a bot). A CI merge-gate (`backend imports` + `frontend builds`)
-must pass before any PR is merged, since `main` deploys straight to production.
+Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md). They
+enter the project under Apache-2.0, like the rest of the code; there is no CLA
+to sign. A CI merge-gate must pass before any PR is
+merged, since `main` deploys straight to production: the backend imports on
+production's Python (3.12) and its tests pass on 3.11 and 3.12, the frontend
+builds and passes its browser suite (`cd frontend && npm run test:e2e`, no
+backend needed, see [`frontend/e2e/README.md`](./frontend/e2e/README.md)), and
+the Docker image builds and boots. Actions are pinned to commit
+SHAs, and Dependabot proposes the updates once a month.
 
 ## Deployment
 
@@ -201,6 +311,21 @@ the deploy pipeline, required GitHub secrets, and rollback procedure.
 
 ## Eval
 
+**Results: [`EVAL_RESULTS.md`](./EVAL_RESULTS.md).** On the same five
+real-world cases, the v2 overall score went from 49.7 (2026-04-19) to 74.4
+(2026-06-17); the decay-proof capability score (v3 CAP) reads 92.9 → 96.0 over
+its three runs. Hallucination is a hard gate: it fired once, in the first run,
+and the scorecards that audit it report 0 since. The page also says what these
+numbers do not show: they are self-graded, the rubric changed, and the model
+changed. The one external reference is the same model run without the tool
+(2026-10-21, `claude-opus-5` throughout): mean NR on the five positive cases is
+55.5 with Bounce-CTI, 83.0 for the bare model with web search and 14.7 for the
+bare model alone. The web-search figure comes with a caveat: the ground truth
+is built from public write-ups, and the bare model fetched its case's own
+write-up on 3 of the 5 cases, so these cases favour search over investigation.
+
 `EVAL_PROTOCOL.md` is the active scoring rubric for the agent. Re-run it
 against a new commit whenever you touch the agent system prompt, MCP tool set,
-defuse lists, or source integrations. Past runs live under `runs/`.
+defuse lists, or source integrations. Past runs live under `runs/`; after
+archiving one, regenerate the digest with `python eval/results_digest.py`
+(CI fails if `EVAL_RESULTS.md` is stale).

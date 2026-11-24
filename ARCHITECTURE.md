@@ -56,7 +56,7 @@ FastAPI app. All `/api/*` and `/ws/*` are gated by a session cookie except
 > optional `effort` (extended-thinking level). The chosen `effort` is persisted
 > on the investigation row and reused by `resume` / subsequent phases.
 
-- `POST   /api/investigations` — start (auto-detects seed type from value if `seed_type=auto`; supported types: `domain`, `ip`, `hash`, `url`, `jarm`, `asn`, `command_line`, `executable_name` — the last being a bare filename of a malicious binary such as `dropper.exe`, pivoted via MalwareBazaar's `get_filename` — and `email` / `wallet_address` / `username` for actor-level seeds: an email triggers Whoxy reverse-WHOIS + EmailRep + Pulsedive + OpenCTI; a wallet (ETH `0x…`, BTC bech32 / legacy, XMR — auto-detected by address format) cross-references ThreatFox + Pulsedive + OpenCTI; a forum / Telegram handle is graphed as an opaque identifier and probed against ThreatFox / Pulsedive / OpenCTI / URLScan). Optional `vertical` field (default `cti`; normalised via `backend/verticals.py`, unknown → `cti`) stored on the investigation.
+- `POST   /api/investigations` — start (auto-detects seed type from value if `seed_type=auto`; supported types: `domain`, `ip`, `hash`, `url`, `jarm`, `asn`, `command_line`, `executable_name` — the last being a bare filename of a malicious binary such as `dropper.exe`, pivoted via MalwareBazaar's `get_filename` — and `email` / `wallet_address` / `username` for actor-level seeds: an email triggers Whoxy reverse-WHOIS + EmailRep + Pulsedive + OpenCTI; a wallet (ETH `0x…`, BTC bech32 / legacy, XMR — auto-detected by address format) cross-references ThreatFox + Pulsedive + OpenCTI; a forum / Telegram handle is graphed as an opaque identifier and probed against ThreatFox / Pulsedive / OpenCTI / URLScan). Optional `vertical` field (default `cti`; normalised via `backend/verticals.py`, unknown → `cti`) stored on the investigation. Optional `capture` field (default `false`, **admin only**: 403 for anyone else, before anything starts) records every source response the investigation reads into `data/fixtures/capture/<id>/` (EVAL_PROTOCOL §4.C); the response echoes it as `fixture_capture`. Optional `context_pool` field (default `false`, **admin only**: 403 for anyone else, 409 when the kill switch `BOUNCE_CTX_ENABLED=0` is set, both before anything starts) mounts the context pool (`mcp__ctx__*`, `backend/context_pool.py`) for this investigation whatever the vertical's policy, so an eval run can measure CTI with it; the response says what the agent will mount as `context_pool` and `context_pool_web` (false when `BOUNCE_CTX_WEB=0` leaves only `recall_prior_knowledge`).
 - `POST   /api/investigations/batch` — start many at once; `combined=true` chains them on one graph. Accepts the same optional `vertical` field (applied to every investigation in the batch)
 - `GET    /api/investigations` — list (caller-owned only)
 - `GET    /api/verticals` — selectable verticals for the new-investigation form (`[{name, label, seed_types}]`, from `backend/verticals.py`). Drives the frontend vertical selector + per-vertical seed-type hints so the UI stays in sync with the registry
@@ -66,6 +66,15 @@ FastAPI app. All `/api/*` and `/ws/*` are gated by a session cookie except
   after page reload (live WebSocket events only cover the current session).
   Entries are tagged `reasoning` / `tool` / `tool_result` / `phase` so the
   client can render the audit trail with full agent text and per-tool inputs.
+- `GET    /api/investigations/{id}/progress` — where the current run stands
+  (`backend/run_progress.py`): `run` (`kind`: `investigation` / `add_seed` /
+  `pivot` / `custom_prompt`, `started_at`, `ended_at`, `end_status`,
+  `stopped_by_user`), `phase` (the one in flight, null between phases and once
+  the run is over), `phases` (finished ones, in order), `drain` (`round`,
+  `max_rounds`), `source_calls` (whole investigation, the pivot-drain loop's
+  own counter), `source_calls_run`, `ceiling` (`BOUNCE_TOTAL_CTI_BUDGET`, null
+  for a run with no drain loop), `status`, `running`, `vertical`, `now`.
+  Read-only and small; the UI polls it every 10 s while the run is live.
 - `GET    /api/investigations/{id}/nodes/{node_id}/cross_investigations` —
   list every prior investigation owned by the caller where the same
   `(type, value)` IOC already appeared. Powers the Node-tab "Also seen in
@@ -77,6 +86,9 @@ FastAPI app. All `/api/*` and `/ws/*` are gated by a session cookie except
   network IOCs as a drop-list. `fmt`: `plain` (default), `hosts`,
   `unbound`, `rpz`, `palo_edl`, `cisco_acl`, `csv`. Defused nodes
   (CDN/parking/sinkhole/Tor/...) excluded unless `include_defused=1`.
+  The tag list is `action_exports._DEFUSED_TAGS`; it holds every tag
+  `defuse_lists.defuse_check` can emit, which
+  `tests/test_action_exports_defused.py` checks from that function's source.
 - `GET    /api/investigations/{id}/actions/detection?fmt=...` — starter
   detection rule. `fmt`: `sigma` (default), `snort`, `yara`. Hashes
   flagged `nsrl_known` and defused indicators are excluded.
@@ -93,10 +105,17 @@ FastAPI app. All `/api/*` and `/ws/*` are gated by a session cookie except
   dossier (Markdown): sanctions-exposure headline, subject identity, corporate
   hierarchy, officers / PSC, provenance, with the estimated-ownership +
   candidate-match disclaimers (`backend/dd_export.py`).
-- `POST   /api/investigations/{id}/stop` — kill the running agent
-- `DELETE /api/investigations/{id}`
+- `POST   /api/investigations/{id}/stop` — stop the run: the agent process of the
+  phase in flight is killed and no later phase starts (nor the next seed of a
+  batch / PDF / sample chain). Status `done`, with a `status_change` event
+  carrying `stopped_by_user: true`, written in the request for any investigation
+  that was `running`; the run then logs one `agent_exit` (`stopped_by_user`,
+  `stopped_during`). Returns `{ok, killed}` (`killed` is false when the stop
+  landed between two phases). Graph and events are kept; resume and rerun work
+  afterwards.
+- `DELETE /api/investigations/{id}` — stops the agent, deletes the investigation and its fixture capture, if any
 - `PATCH  /api/investigations/{id}` — rename (`{title}`); empty/omitted title clears it, falling back to the seed value in the UI
-- `POST   /api/investigations/{id}/rerun`
+- `POST   /api/investigations/{id}/rerun` — clears the graph and runs again; an existing fixture capture of the investigation is deleted with it (a fixture set holds one run)
 - `POST   /api/investigations/{id}/resume` — pick up an investigation halted by a Claude-subscription quota error (425 while still in cooldown)
 - `GET    /api/quota` — Claude-subscription quota state for the host account (`{exhausted, exhausted_until, message, last_seen}`); the frontend polls it to render a global banner + per-investigation Resume button
 - `POST   /api/investigations/{src}/merge_into/{dst}` — merge `src` into `dst`
@@ -110,7 +129,12 @@ FastAPI app. All `/api/*` and `/ws/*` are gated by a session cookie except
 - `GET    /api/investigations/{id}/csv`  — render STIX-flavoured CSV of observables
   (OpenCTI workbench-ready: `stix_type`, `entity_type`, `value`, hash columns,
   `labels`, `confidence`, `sources`, `description`, `first_seen`, `last_seen`)
-- `GET    /api/investigations/{id}/nodes/{node_id}/evidence`
+- `GET    /api/investigations/{id}/leads` — context-pool leads + corroboration
+  telemetry (`corroboration_rate`, per-claim-type breakdown, ctx budget usage)
+- `GET    /api/investigations/{id}/nodes/{node_id}/evidence` — the cached source answers
+  about the node's value (`{node_id, value, evidence: [{cache_key, data, cached_at}]}`,
+  oldest first). An answer is returned when its cache key holds the value as a whole
+  token (`backend/evidence_match.py`); a value under 3 characters returns an empty list
 - `POST   /api/investigations/{id}/nodes/{node_id}/tag` — toggle a tag (e.g. `pinned`)
 - `POST   /api/investigations/{id}/nodes/{node_id}/note` — set/clear analyst note
 
@@ -125,6 +149,28 @@ FastAPI app. All `/api/*` and `/ws/*` are gated by a session cookie except
   agent as `report_context`). Exactly one of the two must be supplied.
 - `GET /api/admin/lessons_learned?limit=N` — admin-only feed of agent
   retrospectives backed by `data/lessons_learned.jsonl`
+- `GET /api/admin/eval/fresh_iocs?days=N` — admin only — ThreatFox's last
+  `N` days (1-7, default 2) of indicators as candidate prospective seeds
+  (EVAL_PROTOCOL §4.E), each with `excluded_by`: the §4.E rules it breaks
+  (`backend/eval_judge.py`). Uses the server's `ABUSECH_AUTH_KEY` (503 without
+  it), fetched live, never from the cache; 502 when ThreatFox fails
+- `POST /api/admin/eval/pivot` — admin only — the mechanical arm `pivot-1`
+  (EVAL_PROTOCOL §4.E rule 1) for one seed `{"type", "value"}`: the mandatory
+  tools of its type (`seeds.mandatory_tools`) run on the seed alone, NO model
+  (`backend/pivot_arm.py`); every IP, domain, URL and hash in their answers
+  becomes a node, filtered by the exports' own neutralisation (`defuse_check`
+  tags, then `action_exports._iter_actionable`). Answers a `graph.json`
+  (`nodes`, `edges`, `metadata.tools`: one status per tool, a failed tool is
+  shown, never an empty answer); 422 for a type with no mandatory tools
+- `POST /api/admin/eval/judge` — admin only — judge v2 (`otx+abusech/2`) on
+  `{"claims": [{"type", "value"}]}`, at most 20 a request: OTX with the
+  server's key, ThreatFox, URLhaus, MalwareBazaar, exact match, live, with
+  each listing's id, creation date and author. `{judge, lookups}` keyed
+  `type|value`; 503 without `ABUSECH_AUTH_KEY`, 422 over 20 claims. With
+  `"entries": ["threatfox:<id>", …]` (at most 20, 422 beyond) the answer adds
+  `entries`: each seed's own ThreatFox entry read by its id (`present` with its
+  value, type, `first_seen` and whether the wildcard and the `exact_match`
+  search return it; `not_present` on `no_result`; any other answer an error)
 
 **Sharing**
 
@@ -137,12 +183,18 @@ FastAPI app. All `/api/*` and `/ws/*` are gated by a session cookie except
 - `POST   /api/shares/{token}/revoke`
 - `GET    /api/share/{token}` — **public** (no auth) — filtered investigation payload
 - `POST   /api/share/{token}/import` — clone the share, or merge it into one of the caller's investigations
+- `GET    /api/investigations/{id}/demo_snapshot?label=…&forbid=…` — owner only —
+  the investigation frozen as a static demo snapshot (`backend/demo_snapshot.py`),
+  checked against the server's own secrets and the `forbid` words: 422 with the
+  problems (a secret is named, never printed), 503 if the server's `.env` exists
+  but can't be read, else `{snapshot, warnings, checked_secrets}`
 
 **Live events**
 
-- `WS /ws/{id}` — snapshot on connect, then incremental events
-  (`node_added`, `node_updated`, `edge_added`, `node_tagged`, `agent_*`,
-  `status_change`, `server_shutdown` on graceful restart)
+- `WS /ws/{id}` — the graph snapshot on connect, then every event the
+  investigation has logged so far (replayed from the first), then new ones as
+  they are written (`node_added`, `node_updated`, `edge_added`, `node_tagged`,
+  `agent_*`, `phase_*`, `status_change`, `server_shutdown` on graceful restart)
 
 ### `backend/agent_runner.py`
 Spawns `claude -p` (Claude Code headless) with:
@@ -151,12 +203,23 @@ Spawns `claude -p` (Claude Code headless) with:
   whether the seed is parked / sinkholed)
 - Per-investigation `mcp.json` (rendered from the `mcp.json` template, with
   `${BOUNCE_PYTHON}` / `${BOUNCE_INV_ID}` / `${PYTHONPATH}` substituted)
-- `--allowedTools` restricted to MCP tools only (graph + cti)
+- `--allowedTools` restricted to MCP tools only (graph + the vertical's source
+  pool, plus `mcp__ctx__*` + the lead tools when the context pool is mounted —
+  `build_allowed_tools_for`). The native `WebSearch` / `WebFetch` stay
+  **disallowed even then**: open-web access goes exclusively through the wrapped
+  `mcp__ctx__` versions, which are cached, budgeted, SSRF-guarded and can only
+  mint `lead` nodes.
 - `--disallowedTools` blocking `Bash,Edit,Write,MultiEdit,Read,Glob,Grep,NotebookEdit,WebSearch,WebFetch,Task,TodoWrite`
 - `--permission-mode bypassPermissions`
-- Configurable `--model` (`sonnet` / `opus` / `opus-4.7` / `opus-4.8` /
-  `haiku`); the `opus-4.7` / `opus-4.8` aliases map to `claude-opus-4-7` /
-  `claude-opus-4-8`
+- Configurable `--model`: every alias maps to an exact model id in
+  `agent_runner._MODEL_ALIASES`. The bare tier aliases are the current model
+  of their tier, pinned to the newest one the production CLI runs (`sonnet` →
+  `claude-sonnet-5-5`, `opus` → `claude-opus-5`, `haiku` → `claude-haiku-5-5`;
+  `claude-opus-5-5` needs CLI ≥ 2.1.280); the versioned aliases never move —
+  `sonnet-5` / `opus-5` / `fable-5` (Claude 5 family → `claude-sonnet-5` /
+  `claude-opus-5` / `claude-fable-5`) and `opus-4.8` / `opus-4.7`
+  (→ `claude-opus-4-8` / `claude-opus-4-7`). A model the host CLI refuses
+  ends the run after one phase as `error: model` (`_detect_model_unsupported`)
 - Configurable extended-thinking effort: the per-investigation `effort` level
   (`low` / `medium` / `high` / `xhigh` / `max`, or unset = model default) is
   stored on the `investigations` row and applied to every phase spawn via the
@@ -176,6 +239,13 @@ After the main run, additional phases run automatically:
   appends graph-state-aware adaptive Phase 3 targets from
   `_adaptive_followup_targets`, surfaces the chosen working_hypothesis to
   anchor pivot decisions, and runs the agent again.
+- **Phase 2b — `phase_corroborate_leads`** (added 2026-07, context pool): runs
+  only when the context pool is mounted for the vertical AND leads are still
+  unverified. Feeds the agent each pending lead's `verifiable_by` / `falsifier`
+  and requires one `corroborate_lead` call per lead. Deliberately placed
+  **before** the report is written, so the report describes leads by their
+  verdict rather than asserting them — and so `corroboration_rate` becomes a
+  real per-run measurement. Capped at `BOUNCE_CORROBORATE_MAX_TURNS` (default 30).
 - **Phase 3 — `phase_report_write`**: if no `investigation_summary` report
   node exists, runs a single-purpose phase to write one (with mechanically-
   extracted discriminating-marker candidates pre-injected as MUST INCLUDE
@@ -188,6 +258,14 @@ After the main run, additional phases run automatically:
   caps cumulative `mcp__cti__*` calls across all phases — the loop counts
   raw CTI calls (`_count_cti_calls`) before each round, stops when <8 calls
   of headroom remain, and clamps the round's turn budget to the remainder.
+  Skipped (event `phase_pivot_drain_skipped`, reason `concluded_benign`) for a
+  CTI seed the run concluded legitimate: every `working_hypothesis` says
+  `legitimate`, the `investigation_summary` threat_assessment reads as benign
+  and no seed node carries a malicious tag (`_concluded_benign`). osint/dd are
+  not gated; `BOUNCE_PIVOT_DRAIN_ON_BENIGN=1` turns the gate off. A gate error
+  fails open (the drain runs) and logs `phase_pivot_drain_gate_error`.
+  `eval/drain_gate_replay.py --db <bounce.db>` replays the gate on every past
+  drain, read-only, and lists what it would skip and what it misses.
 - **Phase 5 — `phase_lessons_learned`**: short retrospective. The agent
   reads the graph + `gaps_report()` + `queue_status()` and writes a
   single hidden `lessons_learned` report node listing blockers, missing
@@ -200,7 +278,16 @@ The runner also exposes:
 - `run_pivot(...)` — pivot from an existing node (used by `/enrich`)
 - `run_add_seed(...)` — chain a peer seed onto the same graph
 - `run_custom_prompt(...)` — analyst-authored prompt with optional selected nodes
-- `stop_investigation(inv_id)` — SIGTERM the spawned process group
+- `stop_investigation(inv_id)` — ends the run: counts the stop (`_stop_count`)
+  and SIGTERMs the spawned process group. A run is several phases, each its own
+  process, and a killed phase returns like a failed one (rc=-15, no `result`
+  event), so every run entry point records the count it started with
+  (`_begin_run`) and checks it after each phase (`_halt_on_user_stop`, next to
+  the quota and ops halts); `_run_claude_phase` spawns nothing for a run whose
+  count has moved. It is a count because a killed phase takes up to a watchdog
+  poll (10 s) to return: a rerun started meanwhile must leave the stop visible to
+  the old run and must itself run on. `stop_count(inv_id)` lets `main.py` end
+  its chains of runs (`_chain_stopped`).
 
 stdout/stderr are pumped into the SQLite `events` table; the WebSocket handler
 polls events and streams them to the browser.
@@ -209,6 +296,37 @@ polls events and streams them to the browser.
 paths are converted from `C:\…` to `/mnt/c/…` so WSL `claude` can invoke them
 via Windows interop. A separate `mcp-launcher-{module}.log` is written under
 `data/` for each MCP server start to debug timeouts.
+
+### `backend/run_progress.py`
+Where a run stands, for `GET /api/investigations/{id}/progress`. Computed from
+the `events` table and the investigation row, so every client reads the same
+answer and it survives a reload.
+
+- **This run** is everything logged since the last `agent_starting`. A rerun
+  deletes the earlier events; a resume, an added seed, a manual pivot and a
+  custom prompt keep them and log their own `agent_starting`, so each is a run
+  of its own (its `kind` comes from that event's `phase` field).
+- **Phases** come from `phase_<name>_starting` / `phase_<name>_exit`. The other
+  `phase_*` kinds are bookkeeping; `phase_pivot_drain_starting` is the drain
+  loop's header (it carries `max_rounds` and `total_cti_budget`, which win over
+  the environment the route reads later). A phase name the module has never
+  seen goes through untouched; the client gives it readable words.
+- **A run ends** at `agent_exit` or at a `status_change` to anything but
+  `running` (quota halt, ops error, service restart, stop). A phase starting
+  after that reopens it: `POST /stop` kills the phase in flight and
+  `run_investigation` then goes on with its next phase.
+- **Source calls** are counted as `agent_runner._count_cti_calls` counts them
+  (`tool_use` blocks of the vertical's source pool, over the whole
+  investigation); a test holds the two equal. `ceiling` is
+  `BOUNCE_TOTAL_CTI_BUDGET`, which the pivot-drain loop alone compares to that
+  count: the earlier phases are not capped by it and the count can end above
+  it. A run with no drain loop reports `ceiling: null`. Context-pool calls
+  (`mcp__ctx__*`) have their own budget and are left out.
+- Cost: the control events of the current run plus the `agent_assistant` rows;
+  the large tool results (`agent_user` rows) are never read.
+
+`compute` and `count_source_calls` are pure; locked by
+`backend/tests/test_run_progress.py`.
 
 ### `backend/seeds.py`
 Seed registry — the single source of truth for per-seed-type behaviour. Replaces
@@ -272,11 +390,11 @@ SQLite-backed store. Tables:
 
 | Table            | Columns (essentials)                                                                                                          |
 |------------------|-------------------------------------------------------------------------------------------------------------------------------|
-| `investigations` | `id`, `seed_type`, `seed_value`, `created_at`, `status`, `user_id`, `model`, `effort` (extended-thinking level, or NULL = model default), `quota_reset_at` (epoch when a Claude-subscription cooldown lifts), `title` (optional analyst-supplied rename; falls back to `seed_value` in the UI), `vertical` (`cti`\|`osint`\|`dd`, default `cti` — which product vertical the investigation belongs to) |
+| `investigations` | `id`, `seed_type`, `seed_value`, `created_at`, `status`, `user_id`, `model`, `effort` (extended-thinking level, or NULL = model default), `quota_reset_at` (epoch when a Claude-subscription cooldown lifts), `title` (optional analyst-supplied rename; falls back to `seed_value` in the UI), `vertical` (`cti`\|`osint`\|`dd`, default `cti` — which product vertical the investigation belongs to), `fixture_capture` (0/1, default 0: record this investigation's source responses, EVAL_PROTOCOL §4.C), `context_pool` (0/1, default 0: an admin forced the context pool on for this investigation; 0 = the `BOUNCE_CTX_ENABLED` policy decides) |
 | `nodes`          | `id`, `investigation_id`, `type`, `value`, `metadata` (JSON), `tags` (JSON), `confidence`, `source`, `created_at`, UNIQUE(inv,type,value) |
 | `edges`          | `id`, `investigation_id`, `src`, `dst`, `relation`, `evidence`, `source`, `confidence`, `created_at`, UNIQUE(inv,src,dst,relation) |
 | `events`         | `id` AUTOINCREMENT, `investigation_id`, `kind`, `payload` (JSON), `created_at` — full agent stream + state changes            |
-| `cache`          | `key`, `value` (JSON), `created_at` — HTTP response cache (TTL per source)                                                    |
+| `cache`          | `key`, `value` (JSON), `created_at` — HTTP response cache (TTL per source). Auth parameters (`key`, `apikey`, `token`…) never enter a key (`http_client.cache_params`); rows written before that are deleted at backend startup by `purge_secret_cache_keys` (pure SQL with `secure_delete`, then a one-off `VACUUM` when rows were removed so no copy survives in the file; logs the count only) |
 | `users`          | `id`, `pin_hmac` (UNIQUE), `created_at`, `is_admin`, `allowed_models` (JSON or NULL), `label`                                 |
 | `sessions`       | `token` (PK), `user_id`, `expires_at`                                                                                         |
 | `shares`         | `token` (PK), `investigation_id`, `created_by`, `created_at`, `sections` (JSON), `expires_at`, `revoked`, `label`             |
@@ -284,7 +402,10 @@ SQLite-backed store. Tables:
 | `quota_state`    | single-row table (`id=1`): `exhausted_until` (epoch), `message`, `last_seen` — Claude-subscription cooldown shared across the host account |
 
 Node IDs are SHA1 hashes of `(investigation_id, type, value)` (lower-cased) —
-so upserts are idempotent.
+so upserts are idempotent. An upsert merges `metadata`, `tags` and
+`metadata.sources_seen`; `source`, `confidence` and `created_at` are written
+once, by the first report. The `node_updated` event carries those stored
+values, so a live client and a reload show the same source and confidence.
 
 `canonical_node_type(type, value, metadata)` disambiguates the TLS-fingerprint
 node types agents tend to conflate: `jarm` (62-hex active server fingerprint)
@@ -297,11 +418,41 @@ land on the corrected node id instead of a phantom `jarm` one. JARM is never
 inferred merely because a value is a TLS fingerprint.
 
 `init_db()` runs idempotent migrations: it `_ensure_column`s `user_id`/`model`/
-`effort`/`quota_reset_at`/`title`/`vertical` on `investigations` and
+`effort`/`quota_reset_at`/`title`/`vertical`/`fixture_capture`/`context_pool` on `investigations` and
 `is_admin`/`allowed_models`/`label` on `users` for upgrades from earlier
 schemas. `vertical` defaults to `'cti'`, so legacy rows and any caller that
 doesn't pass one keep the original CTI behaviour (`graph_store.get_vertical()`
 also falls back to `'cti'`).
+
+### `backend/evidence_match.py`
+Decides which cached source answers are about a node's value, for the evidence
+route above. Pure: `like_pattern(value)` gives the coarse SQL prefilter (the
+longest run of the value that percent-encoding leaves alone, with `%`, `_` and
+the escape character escaped), `key_mentions(key, value)` the exact check that
+`graph_store.get_evidence_for_value` runs on each candidate key before it loads
+the answer. Rules, all locked by `tests/test_evidence_match.py`:
+
+- The value must be a whole token of the key: a letter or digit on either side
+  means a longer token (`11.2.3.45` vs `1.2.3.4`, a longer hash vs its prefix),
+  and `.`, `-`, `_`, `@` join when a letter or digit follows them
+  (`sub.example.com`, `example.com.evil.net`, `my-example.com`,
+  `user@example.com` are other indicators than `example.com`). The wildcard
+  queries `%.example.com` / `*.example.com` and a trailing dot are about
+  `example.com`.
+- In an IPv6-shaped value `:` joins too when a hex digit follows it.
+- A URL value must end where the key's URL ends (one trailing `/` tolerated):
+  a deeper path or a query string is another URL. A domain does match a
+  question about a URL on that exact host.
+- The head of the key (verb or source name) and, for `http_client`'s default
+  keys, the API's own host are never a mention: a node `rdap.org` is not
+  evidenced by every RDAP lookup.
+- Case-insensitive for every type (the sources lowercase what they put in their
+  own keys); key and value are percent-decoded before the comparison; the value
+  is compared as plain text, so `%`, `_` and regex metacharacters match
+  themselves.
+- A value under `MIN_VALUE_LEN` (3) characters matches nothing, so the route
+  cannot return the whole cache. Bookkeeping keys (`fixtures.is_source_key`)
+  stay excluded.
 
 ### `backend/auth.py`
 - HMAC-SHA256 of the PIN with a per-deploy secret stored in `data/secret.key`
@@ -325,10 +476,25 @@ MCP server exposing graph write/read tools + the autonomy engine to the agent:
   actor-handle tag (`ACTOR_HANDLES`) to a first-class `threat_actor` node +
   `attributed_to` edge, and likewise a known phishing-kit tag (`KIT_HANDLES`)
   to a `phishing_kit` node + `uses_kit` edge (provenance preserved).
+  **Context-pool tier boundary**: when `source` is `parametric_memory` or
+  `web:*` (or `type == "lead"`), the node is collapsed to a `lead`, its
+  confidence clamped to ≤ 0.35, and the `unverified` tag forced — the original
+  requested type is kept in `metadata.proposed_type` for the promotion path.
+  Actor/kit tag promotion is suppressed for leads so a guess cannot be laundered
+  into a first-class attribution.
 - `add_edge(src_type, src_value, dst_type, dst_value, relation, evidence, source, confidence)`
   — auto-creates a `phantom_autostub`-tagged stub for any missing endpoint so
   edges never dangle (the analyst can spot the unresolved reference)
 - `tag_node(type, value, tag)`
+- `corroborate_lead(lead_value, verdict, evidence_tool, evidence_value, note,
+  promote_as_type, promote_as_value)` — the ONLY path from context-pool material
+  to a finding. `verdict` ∈ `corroborated` | `refuted` | `unverifiable`;
+  corroboration requires a **primary** source tool as evidence (a `mcp__ctx__*`
+  or `mcp__graph__*` tool is rejected). On `corroborated` + `promote_as_*` the
+  real typed node is minted with the *primary tool* as its provenance and linked
+  back with a `corroborated_by` edge. Closes the lead's `verify_lead` pivot.
+- `lead_status()` — counts, corroboration rate, and the leads still awaiting a
+  verdict.
 - `get_graph(compact: bool = False, stats_only: bool = False)` — full, compact
   (slim metadata), or stats-only (shape + tag counts, no node/edge lists)
 - `get_node(type, value)` — fetch one node's full metadata
@@ -378,7 +544,10 @@ MCP server exposing ~50 async CTI source tools:
   `virustotal_subdomains`, `virustotal_communicating_files`
 - URLScan: `urlscan_search`, `urlscan_result`
 - Onyphe Griffin (datascan / threatlist / pastries / geoloc / domain / ip)
-- Shodan: `shodan_host`, `shodan_search`
+- Shodan (free-first — see "Shodan credit policy" below): `shodan_host` (0 credits),
+  `shodan_host_count` (0 credits, count + facets), `shodan_api_info` (0 credits),
+  `shodan_search` (**1 query credit per 100 results — disabled by default**)
+- Shodan InternetDB: `internetdb_ip` — ports/CPEs/CVEs/hostnames, **no key, no credits**
 - OTX: `otx_domain`, `otx_ip`, `otx_file`
 - ThreatFox: `threatfox_search`
 - abuse.ch: `urlhaus_host`, `malwarebazaar_hash`, `malwarebazaar_signature`, `malwarebazaar_filename` (filename-only pivot — returns sample hashes ever reported under that name, used as the primary pivot for `executable_name` seeds), `malwarebazaar_imphash` (PE imphash → sibling-sample cluster, one-call loader-family expansion)
@@ -585,12 +754,57 @@ names: `vt`, `urlscan`, `onyphe`, `shodan`, `otx`, `abusech`, `abuseipdb`,
 `certspotter`, `netlas`, `whoxy`, `zoomeye`, `criminalip`, `opencti`. Sources call
 `acquire(src)` and degrade gracefully when None is returned.
 
+### Shodan credit policy (`backend/sources/shodan.py`, `backend/config.py`)
+
+A Shodan **Membership** grants 100 query credits + 100 scan credits per month,
+shared by every investigation on the instance and reset monthly (rollover is not
+documented — don't count on it). The important asymmetry: **nearly the whole API
+is free**, so the platform is wired free-first.
+
+| Call                          | Credits | Notes                                    |
+|-------------------------------|---------|------------------------------------------|
+| `internetdb_ip`               | 0       | **no key at all**; ports/CPEs/CVEs/hostnames/tags; ~weekly refresh, no banners |
+| `shodan_host`                 | 0       | full record incl. banners, TLS, JARM     |
+| `shodan_host_count`           | 0       | result count + **facets** for any query, filters included |
+| `shodan_api_info`             | 0       | plan + remaining credits + local policy  |
+| `shodan_dns_resolve`/`_reverse` | 0     | bulk DNS, one call for many names        |
+| `shodan_search`               | **1 per 100 results** | only when the query has a filter or pages past page 1 — i.e. every useful CTI pivot |
+
+Because every high-signal pivot query is filtered, `shodan_search` is **disabled
+by default**. It returns a structured refusal *without issuing any HTTP request*
+(so a credit cannot be spent) naming the free equivalents. Operators opt in with
+`BOUNCE_SHODAN_ALLOW_CREDITS=1` and may cap per-process spend with
+`BOUNCE_SHODAN_CREDIT_BUDGET=N`. Policy lives in `config.shodan_credits_allowed()`
+/ `config.shodan_credit_budget()` (read live from env, not captured at import).
+
+Consequences elsewhere:
+- **Pivot queue** — `shodan_search` is in `pivot_mapping.CREDIT_METERED_OPS`, so
+  while credits are off it is enqueued as `skipped` with
+  `skip_reason='credit_metered'` (visible in `gaps_report` as a deliberate cost
+  decision, not a silent omission). The free `shodan_host_count` is queued in its
+  place on `jarm` / `favicon_hash` / `asn` nodes.
+- **Mandatory tools** — no seed type may mandate a credit-metered call (a
+  mandatory tool the guard refuses could never be satisfied, so the follow-up
+  phase would nag forever). `jarm` / `asn` seeds mandate `shodan_host_count`;
+  `ip` seeds mandate the keyless `internetdb_ip`. Locked by
+  `tests/test_seeds.py::test_mandatory_tools_never_require_credit_metered_ops`.
+- **On-demand scanning (`/shodan/scan`) and Network Alerts are deliberately not
+  implemented**: scanning spends scan credits *and actively touches the target*
+  (breaking the passive-only posture), and alerts mutate the account's persistent
+  monitoring state, which an autonomous agent should not do.
+- **Transport** — Shodan reports rate limiting as an `error` key with **HTTP
+  200**, so status code alone is not a success signal; `_unwrap` detects
+  error-in-200, never caches it, and maps systemic failures (auth / tier /
+  quota) onto `source_health`. Calls are spaced ≥1.5s (documented limit: 1/s).
+
 ### `backend/pivot_mapping.py`
 Per-node-type pivot rules. `pivots_for(type, value, has_key, defused)`
 returns `[(pivot_op, priority, skip_reason_or_None)]`. Defused nodes only
 receive doc-only pivots (rdap, dns_resolve); the rest are inserted as
 `skipped` with `skip_reason='defused'`. No-key sources are inserted as
 `skipped` with `skip_reason='no_api_key'` so they surface in `gaps_report`.
+Credit-metered ops (`CREDIT_METERED_OPS`) are inserted as `skipped` with
+`skip_reason='credit_metered'` unless credit spending is enabled.
 Unregistered node types return `[]`. The rule table is keyed by canonical type
 and shared across verticals; `register_pivots(type, rules, replace=False)` is
 the cross-vertical extension point (OSINT/DD source modules add their node-type
@@ -680,11 +894,316 @@ Renders an investigation as a STIX 2.1 bundle (JSON) via `generate_stix_bundle`,
 or as a STIX-flavoured CSV of observables via `generate_csv` (one row per
 observable, columns map onto OpenCTI's CSV mapper for direct workbench import).
 
+The bundle builder is split into a DB-backed entrypoint (`generate_stix_bundle`)
+and a pure, unit-testable `build_stix_bundle(nodes, edges, inv, inv_id, tlp=)`.
+Conformance contract enforced by the pure builder (locked by
+`backend/tests/test_stix_export.py`):
+- **SCO hygiene** — cyber-observables (domain-name / ipv4 / ipv6 / url / file /
+  email-addr / autonomous-system / x509-certificate) carry NO `confidence`,
+  `labels`, `created`, `modified` or `created_by_ref` (those are SDO/SRO-only
+  common properties; a strict validator rejects them on SCOs).
+- **Valid emails only** — `email-addr` is emitted only for RFC-valid addresses;
+  privacy-hashed WHOIS tokens (e.g. `f651612a2f356ad3s@`) are dropped and kept
+  on the report as `x_bounce_unmodelled_observables` instead of a malformed SCO.
+- **TLP marking** — a canonical TLP marking-definition (default `TLP:AMBER`,
+  selectable via the `tlp` arg) is added and referenced by every object's
+  `object_marking_refs`.
+- **Spec-valid relationships** — each SRO is checked against the spec's allowed
+  source/target type pairs (`_REL_RULES`); a reversed `resolves-to`
+  (ipv4 → domain) is flipped, and any out-of-spec pair degrades to `related-to`
+  with the original Bounce relation preserved in `x_bounce_relation`.
+- **Indicators** — observables tagged malicious/suspicious are promoted to
+  `indicator` SDOs with a real STIX `pattern` (e.g. `[domain-name:value = '…']`)
+  so the bundle ships deployable detection logic, not just a flat IOC list.
+- **Report** — carries `report_types: ["threat-report"]` (SHOULD) alongside the
+  legacy `threat-assessment:*` label.
+- **Context-pool exclusion** — `lead` nodes and any node still tagged
+  `unverified` / `refuted` / `unverifiable` are skipped, and named on the report
+  as `x_bounce_unverified_leads_excluded`. The report SDO is emitted even when
+  nothing was modellable but something was withheld (falling back to
+  `object_refs: [identity]`, which STIX requires to be non-empty), so a bundle
+  where everything was excluded still says so instead of arriving silently empty.
+
+### `backend/context_pool.py`
+The **second epistemic tier**. The ~90 source tools return *observations*; this
+module governs the two weaker inputs — the agent's **parametric memory** and
+**open-web text** — under one rule:
+
+> Claude is not another source. Claude is the *hypothesis generator*, and the
+> existing source pool is its *jury*.
+
+Everything entering through the context pool becomes a **`lead` node**, never a
+typed IOC:
+
+| Property | Value | Enforced in |
+|---|---|---|
+| `source` | `parametric_memory` or `web:<host>` | `ctx_mcp` |
+| `confidence` | clamped ≤ `0.35` | `graph_mcp.add_node` (server-side, not prompt) |
+| lifecycle tag | `unverified` → `corroborated` \| `refuted` \| `unverifiable` | `graph_mcp.corroborate_lead` |
+| exports | excluded from blocklist / detection / takedown / STIX | `is_actionable()` |
+
+Key functions: `is_lead_source`, `cap_lead_confidence`, `claim_type_denied`
+(the **mechanical** legal guardrails — DD adverse-media and special-category
+claims are refused at the tool boundary, not by prompt convention),
+`is_primary_evidence_tool` (a context tool may never corroborate a context
+tool — memory confirming memory is circular), `corroboration_stats` (the
+per-run hallucination thermometer), `check_fetch_url` /
+`check_fetch_host_address` (SSRF guard), `split_leads` +
+`leads_markdown_section` (shared dossier rendering), and the enablement policy
+`context_pool_enabled` (default **on for `osint` + `dd`, off for `cti`**).
+
+Because a lead is capped, tagged and non-exportable, the same mechanism defends
+against **prompt injection**: text injected into a fetched page can only ever
+mint a low-confidence lead that a primary source must ratify.
+
+### `backend/mcp_servers/ctx_mcp.py`
+MCP server exposing the context pool as `mcp__ctx__*`, mounted alongside the
+vertical's source pool (its own namespace → counted, budgeted and whitelisted
+separately from the `BOUNCE_TOTAL_CTI_BUDGET` the EVAL §4.5 bands are calibrated
+on). Tools:
+- `recall_prior_knowledge(subject, claim, claim_type, verifiable_by, falsifier,
+  self_confidence)` — **no network, no cost**. Forces prior knowledge out of the
+  report prose (where it currently leaks untraced) into an auditable, falsifiable,
+  queued-for-verification record. Requires the model to name the tool that would
+  test the claim and the observation that would kill it.
+- `web_search(query, …)` / `web_fetch(url, …)` — cached (deterministic eval
+  replay), SSRF-guarded, size-capped, budget-charged. Content is returned with an
+  explicit untrusted-data warning.
+- `context_budget()` — remaining allowance + the vertical's forbidden claim types.
+
+### `backend/sources/web_context.py`
+The open-web source behind `web_search` / `web_fetch`. Search backends in
+precedence order: Brave (`BRAVE_SEARCH_API_KEY`) → Serper (`SERPER_API_KEY`) →
+keyless DuckDuckGo HTML (best-effort fallback). Every response is cached in the
+`cache` table so an eval re-run replays byte-identical content instead of that
+hour's SERP. `web_fetch` applies the scheme allowlist, a pre-DNS host check, a
+post-DNS check on every resolved address, a redirect re-check, and a byte cap.
+
+### `backend/fixtures.py` (EVAL_PROTOCOL §4.C)
+Capture and offline replay of source responses, so two eval runs on the same
+code see the same data. Stdlib only, imported by `graph_store` and set up by
+`run_mcp.py` (`activate_for_process()`) before any other backend import.
+
+- **Hook points.** `graph_store.cache_get` / `cache_set`: every source memoises
+  its answer there under a source-specific key, so capture covers a new source
+  without touching it. Capture records writes **and hits** (a warm cache still
+  answered the agent). `dns_tools.resolve_all` / `reverse_dns` keep no cache
+  entry and go through `fixtures.through()`.
+- **What is a source key.** Everything except `BOOKKEEPING_PREFIXES`
+  (`counter|`, `source_health|`, `pdf_source:`, `sample_source:`): budgets,
+  dead-source marks and uploaded context are recomputed by the replayed run.
+- **Capture** (`BOUNCE_FIXTURE_CAPTURE_DIR`, set by `agent_runner._fixture_env`
+  to `data/fixtures/capture/<inv_id>/` when `BOUNCE_FIXTURE_CAPTURE=1` is in the
+  env or `.env`, or when the investigation was created with `capture: true`,
+  stored in `investigations.fixture_capture`): one
+  file per key, `<sha256(key)[:24]>.json` = `{key, source, value}`, canonical
+  text (same response → same bytes), the response's own key order kept, atomic
+  writes. A capture error is logged and swallowed: it never breaks the live run.
+  The per-investigation flag is read on every spawn, so resume, pivot, add-seed
+  and custom prompts keep recording into the same directory; a rerun deletes
+  the previous run's capture first, and deleting the investigation deletes its
+  capture (`agent_runner.reset_fixture_capture`).
+- **Replay** (`BOUNCE_FIXTURE_DIR`): a source key is answered from the set
+  whatever the TTL; `cache_set` of a source key is a no-op; a miss makes
+  `http_client` raise `httpx.ConnectError("fixture replay: no recorded response
+  for …")` before any request, and is appended to `BOUNCE_FIXTURE_MISSES`
+  (`data/fixtures/replay-misses/<inv_id>.jsonl`). `install_offline_guard()`
+  refuses `socket.getaddrinfo` and every socket `connect`/`sendto`/`sendmsg`
+  that would leave the machine, in the MCP process, so a source with its own
+  client (Shodan, InternetDB, WHOIS port 43, DNS) can never fall back to the
+  live internet either. Literal loopback IPs and Unix sockets stay open for the
+  event loop's own plumbing; a host name (even `localhost`) does not resolve. A replay directory that does not
+  exist stops the server at launch (a typo would otherwise score a run where
+  every source "failed").
+- **Secrets.** Before any write, the value of every env var whose name contains
+  `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `AUTH` or `CREDENTIAL` (so
+  `NETLAS_APIKEY` too), plus `OPENCTI_URL`, is replaced by `<secret:SOURCE>` in
+  key and value (values of 8 characters or more), and a write still containing
+  one is refused. Lookups redact
+  the same way. `_env.json` records the NAMES of the keys present at capture;
+  replay stands in `fixture-replay-<NAME>` for those (and only those, so a
+  source that had no key still answers "no key"), which redacts to the same
+  placeholder: a replay needs no API key. `eval/fixture_tool.py verify` is the
+  gate before a commit (`.env` values, credential shapes in keys); `promote`
+  builds and verifies the set in a temp dir and writes nothing to the tree when
+  it fails.
+- **Limits.** Replay pins the data, not the agent's sampling: the miss log is
+  the measure of drift. Source calls made by the main process (the DD sanctions
+  sweep) are replayed but not network-guarded: run replay on a dev instance.
+  `get_evidence_for_value` reads the `cache` table directly and sees nothing in
+  a replay.
+
 ### `run_mcp.py`
 Standalone MCP launcher (at project root). Used as `command` in generated
 `data/mcp-{id}.json` configs. Adds the project root to `sys.path` and runs the
 specified MCP server module. Cross-platform: works whether invoked by Windows
 Python or WSL Python. Writes a startup trace to `data/mcp-launcher-*.log`.
+
+### `eval/results_digest.py` → `EVAL_RESULTS.md`
+Offline, stdlib-only renderer of the published eval digest. Parses every
+`runs/<date>_<sha>/scorecard.md`: the v2 case table (column `Overall`, rows kept
+only when `Status == done`) and, when present, the v3 capability table (column
+`CAP`, positive cases vs negatives `N1..N3`). A run with neither table is listed
+as blocked (never scored) only if its scorecard carries the `RUN STATUS: BLOCKED` line; otherwise the
+script raises, so a format change cannot pass for an outage. The headline trend is computed only on runs that
+completed the whole fresh subset (cases 2, 3, 8, 9, 12), so a smoke run cannot
+read as progress; the page also states the measurement's limits (self-graded,
+rubric changes, model change, data decay, Goodhart on CAP). Not part of the
+running service. `--check` returns 1 when `EVAL_RESULTS.md` is stale, and
+`backend/tests/test_eval_results_digest.py` calls it, so CI fails if a run is
+archived without regenerating the page. It also publishes the latest
+bare-model baseline (`eval/baseline/<date>/results.json`, next section).
+
+### `eval/baseline.py` → `eval/baseline/<date>/`
+The same model without Bounce-CTI (EVAL_PROTOCOL §4.D, roadmap J4). `run --arm
+memory|web` gives each case's seed to `claude -p` with no tool, or with only
+the CLI's WebSearch/WebFetch, from an empty temp directory (no `CLAUDE.md`), no
+MCP server and a filtered environment; it keeps `stream.jsonl`, the parsed
+`answer.json`, and a `graph.json` + `transcript.json` in the shapes
+`eval/fetch.py` writes, with run facts in `run.json` (model from the init
+event, hosts fetched, hosts linked from search results, refused tool calls;
+`compare` re-derives the last three from `stream.jsonl`). It scores every side with
+`scorer.score_case(case, out_dir)` / `score_negative(neg, out_dir)` and, with
+`--write`, leaves `results.json` (scores only) and `results.md`. A citation the
+model writes is kept as `claimed_*` metadata, never as provenance; the
+baseline's corpus is the tool results only, not its own text or queries.
+Stdlib only, not part of the running service; locked by
+`backend/tests/test_eval_baseline.py`. `run --seeds <batch>/seeds.json P1 …`
+runs a prospective batch's seeds instead of `cases.py`'s (next section).
+
+### `eval/prospective.py` → `<batch>/`
+Prospective cases (EVAL_PROTOCOL §4.E): fresh seeds, every arm run in one
+window, judged after a horizon by what an independent feed lists later. `seal`
+reads `<batch>/seeds.json` and one `<arm>/<label>/graph.json` per arm and seed,
+keeps as claims what `backend.action_exports._iter_actionable` would ship
+(domain, ip, url, hash; no lead, no unverified or defused node; the seed left
+out), asks the judge about each, and writes `manifest.json` plus
+`commitment.json` (the manifest's sha256 and counts, no value: the part to
+commit at T). `check` repeats the lookups after `due_at` (exit 3 before, unless
+`--early`), and `score` classes each claim known / ahead / unconfirmed / benign /
+undetermined and gives per arm `ahead_share` and a pooled recall. Both refuse a
+manifest whose hash is not the committed one (exit 1). Judge v1: OTX pulses,
+keyless, a domain asked under `hostname` and `domain`, 3 s between requests; a
+failed lookup is undetermined, never "in no pulse", and a lookup failed at T
+seals nothing (exit 4: seal again later, or with `OTX_API_KEY`). Before any
+lookup, `seal` reads when each seed's run of each arm started (`bounce.json`,
+`pivot-1.json`, or baseline.py's `<label>/run.json` `started_at`) and refuses a
+start more than 48 h after the seed's `first_seen` (rule 1 at run time) or
+outside [first listed, seal], a Bounce-CTI run not `done` (or a `bounce.json`
+filled for other seeds), a web run that ended
+without an answer, and an arm with no start times unless `--allow-unstamped`.
+The starts go into the manifest (`arms.<arm>.runs`), the window into the
+commitment (`runs`). `--drop LABEL=<reason>` leaves a seed out at the seal
+(the contamination rule) without editing `seeds.json`, whose sha256 ties the
+stamped arms to the batch: the manifest keeps it under `dropped`, the
+commitment lists its label (`seeds_dropped`). Stdlib plus
+`backend.action_exports` and `backend.eval_judge`, not part of the running
+service; locked by `backend/tests/test_eval_prospective.py` and
+`test_eval_prospective_arms.py`.
+
+`bounce --batch <b> --out <dir>` fills the Bounce-CTI arm through the server:
+`POST /api/investigations` per seed (opus-5, `vertical: cti`, optionally
+`context_pool: true`), one at a time (the runs spend the operator's
+subscription), its row in `GET /api/investigations` polled until it ends,
+`POST /resume` (at most twice) after `quota_exceeded` or `error: interrupted`,
+and `GET /api/investigations/{id}/graph` written only for a run that ended
+`done`. `<dir>/bounce.json` records each run at submission, before the POST
+is answered (then the server id, the server's start time, status, resumes), so
+a second call picks up where the first stopped and never submits a seed twice:
+a submission with no answer is looked for in `GET /api/investigations` (same
+seed and model, started since, `find_submitted`); exit 5 while a run is not done.
+A server briefly out of reach (connection refused, a 5xx during a restart) is
+polled through; a 4xx (an expired session) stops the command.
+
+With `--server <url> --cookies <jar>` (an admin session), the batch uses the
+server: `seeds` asks `GET /api/admin/eval/fresh_iocs` and picks by a fixed rule
+(`pick/1`: eligible only, one seed per family, the family's newest entry,
+families newest first, `--avoid` the families of an earlier lot), writing
+`seeds.json` once; `preflight` judges the seeds alone; `seal` and `check` ask
+judge v2 through `POST /api/admin/eval/judge`, 20 claims a request. A batch is
+checked by the judge that sealed it. Judge v2 has a positive control: a seed
+picked from ThreatFox must be listed in the judge's `threatfox` section at T,
+or nothing is sealed (exit 4), since a section blind to a known presence makes
+every absence worthless. A seed the search misses is read by its id (route
+`entries`): still in the feed with the seed's value, it is `late` (accepted at
+T while the search returns another seed of the feed, recorded in
+`control_at_t`); gone, another value or unreadable is a refusal. The check's
+control is strict (`control` in the check file): a present seed still missed
+is a blind search and `score` refuses the check (exit 4); a gone one is
+`withdrawn` and reported. Every batch also pre-registers a secondary horizon (30
+days, `--secondary-horizon-days`; `check --secondary` waits for it). Under
+judge v2, a claim the check finds in an abuse.ch entry dated before the seal is
+`known` (`known_late`), not `ahead`, and `score` adds per arm the sections that
+confirmed each `ahead`, the `ahead` confirmed independently of the seed
+(another feed than the seed's, another author than its reporter) and the days
+from the seal to the first dated confirmation.
+
+### `backend/pivot_arm.py`
+The mechanical arm of a prospective batch. `run(type, value)` parses each
+`mandatory_tools` call example (literals only), awaits the tool from the cti
+pool with a 120 s timeout, extracts public IPs, domains, URLs and 32/40/64-hex
+hashes from the answer (keys starting `_` are hints, skipped), tags them with
+`defuse_check`, and keeps what `_iter_actionable` lets through (at most 300
+nodes). Nothing judges them: no node is tagged malicious. No subprocess, no
+`agent_runner` (locked by `tests/test_pivot_arm.py`).
+
+### `backend/eval_judge.py`
+The server side of prospective cases. `fresh_iocs` is ThreatFox `get_iocs`
+turned into candidates (`ip:port` → ip, domain, url, md5/sha1/sha256 → hash),
+each excluded by the §4.E rules it breaks: first listed over 48 h ago, no family
+(`unknown`), confidence under 50, a compromised site, a non-public address, a
+shared platform (the agent's CDN / sinkhole / Tor / dyndns / cloud-platform
+lists plus `SHARED_HOSTS`: shorteners, file and code hosting, paste sites,
+tunnels). `judge` asks each claim of OTX (both `hostname` and `domain` for a
+domain), ThreatFox `search_ioc`, URLhaus (host or URL) and MalwareBazaar
+`get_info`, by type. ThreatFox searches by substring, so a listing counts only
+when its indicator is the claim (an `ip:port` on the claimed host for an ip).
+Listed in any section is listed; "in no listing" needs every section that can
+express the value; a section that cannot is `n/a`. Requests go out with
+`urllib`, never through `graph_store`'s cache (a check answered from the cache
+would repeat T). `entries` reads a seed's ThreatFox entry by id (`ioc` query)
+and searches its value back, wildcard and `exact_match`, so the positive
+control can tell a gone entry from a search that does not return it yet.
+Locked by `backend/tests/test_eval_judge.py`;
+`backend/tests/test_sources_read_only.py` checks that it and every source only
+read (every non-GET request to a listed lookup endpoint, abuse.ch read verbs
+including ThreatFox `ioc`, no upload, no submission path, no GraphQL mutation).
+
+### Static demo: `backend/demo_snapshot.py`, `eval/demo_export.py`, `frontend/demo/`
+One investigation frozen into a JSON snapshot that a static page renders with
+`SharedView`, so a reader clicks through a real run with no backend, no PIN and
+no API key (roadmap J3).
+
+- **What a snapshot holds** (`demo_snapshot.from_view`): exactly what a share
+  link with `graph` + `report` + `timeline` shows (`graph_store.share_view`,
+  the function `get_share_payload` now wraps), minus agent session/request ids,
+  token usage, the MCP config path and working directory, thinking blocks, and
+  everything but the text and tool calls of an assistant message. Report chats
+  never go in. Plus `share.demo`: format, label, model, export time.
+- **Checks** (`demo_snapshot.check`): the value of any secret of the instance
+  that ran the investigation, or a caller-forbidden word, refuses the snapshot;
+  a credential shape (`key=…`, `Bearer …`) is a warning that shows only the part
+  before the value.
+- **Two ways to make one**: the owner route
+  `GET /api/investigations/{id}/demo_snapshot` (server's `.env` + environment),
+  or `python eval/demo_export.py <inv_id> <name> --db … --dotenv …`, which opens
+  the database read-only, copies the investigation's rows into a throwaway
+  database, and refuses to run when it cannot read the `.env` it must check
+  against (exit 2: checking against nothing would pass on nothing). Snapshots
+  live in `eval/demo/<name>.json` (see `eval/demo/README.md`).
+- **The page**: `frontend/vite.demo.config.js` (`npm run build:demo` →
+  `frontend/dist-demo/`, relative base, any static host) builds
+  `frontend/demo/index.html` → `src/demo.jsx` → `SharedView` with `demoSrc`,
+  and copies `eval/demo/*.json` to `dist-demo/data/` (`?case=<name>` picks one).
+  The app build (`vite.config.js`, served by FastAPI) is unchanged.
+  It must be served over HTTP (`python3 -m http.server 8000 --bind 127.0.0.1
+  --directory frontend/dist-demo`). Opened from disk (`file://`), the browser
+  refuses its module script and the snapshot fetch, so `demo/index.html`
+  carries a hint inside `#root`, unhidden by an inline classic script only on
+  `file:`, plus a `<noscript>` (React replaces both over HTTP; pinned by
+  `backend/tests/test_demo_page_offline.py`).
+  `.github/workflows/demo-pages.yml` publishes it to GitHub Pages, **by hand
+  only** (`workflow_dispatch`), and refuses a build with no snapshot.
 
 ### `frontend/`
 React 18 + Vite + Cytoscape.js (cose-bilkent layout). No router — view
@@ -693,31 +1212,84 @@ switching is local state.
 | File              | Responsibility                                                                            |
 |-------------------|-------------------------------------------------------------------------------------------|
 | `main.jsx`        | React entrypoint                                                                          |
-| `App.jsx`         | Main app: Cytoscape canvas, sidebar (investigations + new-seed form), report/chat/node panels, agent event log, mobile drawers |
+| `App.jsx`         | `MainApp`: owns the graph state, the Cytoscape instance, the WebSocket event pump and the investigation actions, and composes the panels; `AppRoot` routes between login, share link and app |
+| `components/`     | Panels fed by `MainApp` through props: `Sidebar` (`NewInvestigationForm`, `InvestigationHistory`, `AddSeedPanel`, `RunProgress`, `AgentLog`), `GraphPane` (canvas, toolbar, filter chips), `GraphLegend` (opened on demand: the node types present, each in its shape and colour, and the border meanings present), `ReportTab` (`LeadsCard`, `HypothesisCard`, `BudgetLog`), `NodeTab` (`StaticAnalysis`, `NodeProvenance`), `TimelineTab`, `ActionsPanel`, `ChatTab`, `PromptBox`, `PickedChips`, `HighlightedText`, `CopyLabel` (the label of a copy button: both texts stacked, so the button keeps one width), `Icon` (one icon of `lib/icons.js` as an inline SVG: 1em, `currentColor`, hidden from assistive technology) |
+| `hooks/`          | State slices of `MainApp`: `useRunSettings`, `useNewInvestigation`, `useNodeData` (lead stats, cross-investigation hits, node note, `useNodeTies`: the selected node's edges), `useQuota`, `usePanelResize`, `useTheme`, `useIsMobile`, `useServerReconnect`, `useGraphSummary` (node types, border meanings and defused count of the graph), `useRunProgress` (the progress document of the open investigation: fetched on open, on run-level WebSocket events, and every 10 s while the run is live) |
+| `lib/`            | Pure modules: `constants`, `ioc` (refang, IOC type detection, subdomain vertical), `graph` (Cytoscape stylesheet, layout options, node data, the theme colours of the canvas, `isDefused`), `legend` (shape glyphs, border meanings, graph summary), `provenance` (a node's origin and ties as plain data, `provenance.test.js`), `timeline`, `reportMarkdown`, `format`, `runProgress` (phase labels, the words of the progress line and of its announcements; `runProgress.test.js`, `node --test`, run in CI), `icons` (the icon set, 16x16 stroke paths, and the rule for which buttons take one; `icons.test.js` checks the sources against it), `pressable` (the props that make an element other than a `<button>` a keyboard button) |
 | `Login.jsx`       | PIN login                                                                                 |
 | `AdminPanel.jsx`  | Admin dashboard: users, allowed-models per user, impersonation                            |
 | `ShareModal.jsx`  | Build a share link (section opt-in + expiry + label)                                      |
-| `SharedView.jsx`  | Public viewer for a `/?share=<token>` link, with import-into-account button               |
+| `SharedView.jsx`  | Public viewer for a `/?share=<token>` link, with import-into-account button; with `demoSrc`, the static demo viewer (no backend, no import; a case picker in the top bar when the build holds more than one snapshot) |
+| `demo.jsx`        | Entry of the static demo build (`frontend/demo/index.html`, `vite.demo.config.js`)        |
 | `styles.css`      | All styling                                                                               |
+
+Browser suite (`frontend/e2e/`, `frontend/playwright.config.js`, `npm run
+test:e2e`): Playwright drives the app in Chromium with no backend. It starts the
+Vite dev server on `127.0.0.1:5199`; `e2e/mockApi.js` answers every `/api/`
+request and the `/ws/<inv_id>` WebSocket from `e2e/fixtures/data.js`
+(hand-written, synthetic). A test fails on an `/api/` call the mock has no
+answer for, and on an uncaught error in the page. It covers boot and login,
+the history and the `?inv=` deep link, the graph search, the copy buttons, the
+Report / Node / Timeline tabs, the phone drawers, and an axe-core scan in both
+themes that tolerates no violated rule (`e2e/a11y-baseline.js` is empty). Canvas
+clicks and pixel comparisons are left out (`e2e/README.md`).
 
 Key in-app helpers:
 - `HighlightedText` — tokenises text, matches IOC values against the graph node
   map, wraps matches in clickable spans that call `focusNode(id)`
-- `focusNode(id)` — selects a node in Cytoscape + animates fit to its neighborhood
+- `focusNode(id)` — selects a node in Cytoscape (and only that one) + animates fit to its neighborhood
+- `NodeProvenance` (Node tab, share viewer) — why a node is in the graph, as
+  text. First where it came from: the source names recorded when it was added
+  (`source`), the names recorded since (`metadata.sources_seen`), the date
+  (`created_at`) and the confidence. The wording follows the tier: a `lead` is
+  a hypothesis from the agent's memory or from open-web text, with its verdict
+  and the tool that gave it (`verdict_evidence_tool` / `_value`); a node with
+  source `agent`, `edge_autostub` or `tag_promotion` says so, and those three
+  are not counted as sources. Then how it is tied to the graph: one line per
+  edge, `this <type>` on the selected node's side, the relation as named on
+  the canvas, the neighbour as a button that calls `focusNode`, and the edge's
+  `evidence` under it. Edges with evidence first, 12 shown, the rest behind a
+  control that gives their exact count. `lib/provenance.js` builds the data
+  (`edgesOf`, `nodeTies`, `nodeOrigin`); `useNodeTies` re-reads the edges on
+  Cytoscape's edge `add` / `remove` events, so the list follows a running
+  investigation (an `edge_added` event writes to Cytoscape and seldom touches
+  React state). In
+  the Node tab the cached source answers ("Evidence (raw data)", loaded on
+  demand, kept per node) are the last level of the same section.
 - `applyFilters(ft)` — hides/shows node types and their incident edges
 - WebSocket handler — dispatches `snapshot/node_added/edge_added/node_tagged/...`
   events to Cytoscape
+- `RunProgress` — one sentence on the open investigation's run: the phase in
+  plain words, the time since the run started (ticking on the server's clock)
+  and the source calls made; a full investigation adds a thin bar, calls ÷
+  pivot-drain budget (`role="progressbar"`). A run that is over leaves one
+  quiet sentence (for good in the sidebar, for a minute in the phone strip,
+  which takes room from the graph). It sits above the agent log, at the foot of
+  the sidebar, and, under 768px, in a strip under the top bar.
+  `RunProgressAnnouncer` is the polite live region: it speaks on a phase change
+  and at the end of a run, and stays silent on ticks and tool calls
 
 UI panels:
 1. **Left sidebar**: new investigation form (single seed or batch, PDF upload,
-   model selector), investigation history, agent event log, share manager.
+   model selector), investigation history, add IOC and share for the open
+   investigation: one column that scrolls. Under it, while an investigation is
+   open, its run keeps the foot of the panel at a height of its own: the
+   progress line and the agent event log (7 lines or more during a run, up to
+   7 once it is over). On a phone the drawer scrolls as one column, the log
+   at its end.
 2. **Center graph**: Cytoscape canvas + floating toolbar (Fit / Relayout /
-   Labels / Export / Copy-to-Maltego / STIX / PDF) + node-type filter chips +
-   edge-relation filter.
+   Labels / Pins / Notes / Defused / Export / Copy-to-Maltego / STIX / PDF) +
+   node-type filter chips + edge-relation filter + a legend opened from the
+   bottom-right corner. The canvas follows the light / dark theme. A node's
+   border says what it is (seed, tag, lead state, pinned); a ring marks the
+   selected node and the picked ones, a flat backdrop a search match. Node
+   types, relations and defused nodes are hidden by one stylesheet `display`
+   rule each; hidden nodes stay in the copies and the counts.
 3. **Right panel**: tabs — Report (investigation summary with clickable IOCs,
    finding cards with source chips, pivot suggestions), Chat (free-form
-   custom-prompt history), Node (metadata, copy JSON, pivot/enrich, pin,
-   note), Timeline (chronological agent activity).
+   custom-prompt history), Node (provenance: origin, ties to the graph with
+   the reason on each edge, cached source answers on demand; metadata, copy
+   JSON, pivot/enrich, pin, note), Timeline (chronological agent activity).
 
 ## Data flow (investigation lifecycle)
 
@@ -737,7 +1309,13 @@ UI panels:
            --max-turns 120
 6. Claude reads system prompt, executes the workflow via MCP tools
 7. Each add_node/add_edge call → SQLite write + event insert
-8. pump_stdout() streams agent JSON events → events table
+8. pump_stdout() streams agent JSON events → events table. Lines are read by
+   _iter_stream_lines(), which puts a line longer than the reader's 64 KiB
+   limit back together (a tool result often is longer); one past 8 MiB is
+   logged as agent_stdout_oversize (size + head). A pump that dies anyway logs
+   agent_stream_error. Before 2026-10-15 the first line past 64 KiB ended the
+   phase's log in silence (EVAL_PROTOCOL §4.A note; measure it with
+   eval/stream_audit.py).
 9. Follow-up phase: if mandatory tools were skipped or no report node exists,
    a second claude -p invocation is launched with a targeted prompt
 10. WS /ws/{inv_id} polls events table every 0.5s → pushes to browser
@@ -787,6 +1365,18 @@ PROJECTHONEYPOT_API_KEY=    # http:BL access key, free
 # NETLAS_API_KEYS=...
 # CERTSPOTTER_API_KEYS=...
 
+# Context pool (model memory + open web) — see backend/context_pool.py
+BOUNCE_CTX_ENABLED=         # auto (default: osint+dd) | all | 0 | explicit list "osint,dd"
+BOUNCE_CTX_WEB=             # 0 disables web_search/web_fetch, keeps recall_prior_knowledge
+BOUNCE_CTX_BUDGET=          # max context-pool calls per investigation (default 12, 0 = unlimited)
+BOUNCE_CORROBORATE_MAX_TURNS=  # turn budget for the corroboration phase (default 30)
+BRAVE_SEARCH_API_KEY=       # optional web_search backend (1st choice)
+SERPER_API_KEY=             # optional web_search backend (2nd choice); else keyless DuckDuckGo
+
+# Eval fixtures (EVAL_PROTOCOL §4.C) — see backend/fixtures.py. Both off by default.
+BOUNCE_FIXTURE_CAPTURE=     # 1 = record each investigation's source responses into data/fixtures/capture/<inv_id>/
+BOUNCE_FIXTURE_DIR=         # replay from this set (e.g. eval/fixtures/case02), network off; dev instance only
+
 CLAUDE_BIN=claude      # path to claude CLI if not in PATH
 ADMIN_PIN=             # optional 6-digit PIN; the matching user is promoted to admin on startup (idempotent). No auto-generation if unset.
 ```
@@ -808,6 +1398,27 @@ npm run dev     # dev server with HMR on :5173, proxies /api + /ws to :8001
 # OR: npm run build  # for production, served by FastAPI at :8001
 ```
 
+### Docker (local run, not the production path)
+
+`docker compose up -d --build` builds one image in two stages: `node:22-slim`
+runs `npm ci && npm run build`, then `python:3.12-slim` gets `requirements.txt`,
+the `claude` CLI from Anthropic's native installer (`~/.local/bin`, one of the
+paths `_resolve_claude_bin()` probes) and the built `frontend/dist`. Everything
+runs as the non-root user `bounce` (uid 10001), because `claude -p
+--permission-mode bypassPermissions` refuses root. uvicorn listens on
+`0.0.0.0:8001` inside the container; compose publishes it on the host's
+`127.0.0.1:8001` only.
+
+Configuration is the same `.env` as a source checkout, bind-mounted read-only
+at `/app/.env` (`create_host_path: false`: a missing file stops the stack
+instead of mounting an empty directory), so `backend/config.py` and the
+per-investigation MCP config read it exactly as they do outside Docker. `data/`
+(SQLite, cache, `secret.key`, launcher logs, captures) is the `bounce-data`
+volume. `init: true` reaps the claude and MCP-server processes of each phase.
+`backend/tests/test_docker_packaging.py` pins the three properties: no secret or
+database in the build context or the image history, loopback-only publishing,
+non-root runtime.
+
 ## Deployment (CI/CD)
 
 The project uses **GitHub Actions** for continuous deployment. Every push to
@@ -823,16 +1434,35 @@ Pull request → main
   │
   ▼
 GitHub Actions (.github/workflows/ci.yml)
-  ├─ backend-import : pip install -r requirements.txt
+  ├─ backend-import : Python 3.12 (production's), pip install -r requirements.txt
   │                   → python -m compileall backend
   │                   → import backend.main
-  ├─ backend-tests  : pip install -r requirements-dev.txt
+  ├─ backend-tests  : Python 3.11 and 3.12, pip install -r requirements-dev.txt
   │                   → pytest backend/tests   (golden/regression tests)
-  └─ frontend-build : npm ci → npm run build
+  ├─ frontend-build : Node 22 (the image's), npm ci
+  │                   → node --test "src/**/*.test.js"   (front-end unit tests)
+  │                   → npm run build
+  │                   → npm run build:demo   (static demo, frontend/dist-demo/)
+  ├─ frontend-e2e   : Node 22, npm ci → npx playwright install --with-deps chromium
+  │                   → npm run test:e2e   (browser suite, API and WebSocket mocked)
+  └─ docker-image   : docker build, then boot the image with no .env: the app
+                      answers, the bootstrap admin logs in, uid 10001, claude CLI
 ```
 
-A failing gate must be fixed before merge. Combine with branch protection on
-`main` (require PR + passing checks) so a broken commit cannot reach prod.
+A failing gate must be fixed before merge. The repository ruleset on `main`
+requires the checks **Backend imports** and **Frontend builds** by name, so
+those two jobs keep their names and carry no matrix (GitHub appends matrix
+values to a check name). `backend/tests/test_ci_workflows.py` pins that, ties
+the CI Python and Node to the Dockerfile's (production runs Python 3.12), and
+refuses any action not pinned to a full commit SHA: `deploy.yml` hands the
+production SSH key to a third-party action, so a movable tag is not acceptable.
+
+`.github/dependabot.yml` proposes updates once a month, grouped, at most two
+open per ecosystem: the pinned actions, the frontend lockfile (minor and patch;
+majors are migrations), and `requirements.txt` only when a floor or a cap must
+move (the `mcp<2.0` cap is never proposed). No Docker entry: the image's Python
+is production's, and moving it is deliberate. A Dependabot PR goes through the
+same gate, and merging it deploys like any other commit.
 
 ### How it works
 
@@ -841,16 +1471,46 @@ Push on main
   │
   ▼
 GitHub Actions (.github/workflows/deploy.yml)
+  │  one run at a time (concurrency: deploy-production): a push that lands
+  │  during a deploy waits for it, a later push replaces the one that waits
   │  SSH into VPS using secrets (VPS_HOST, VPS_USER, VPS_SSH_KEY)
   ▼
 Inline script (defined in deploy.yml, runs on VPS via SSH)
+  ├─ preflight: claude CLI resolves (fatal if CLAUDE_BIN in .env not executable)
   ├─ git fetch + reset to origin/main
   ├─ pip install (only if requirements.txt changed)
-  ├─ npm ci + npm run build (only if frontend/ changed)
-  ├─ preflight: claude CLI resolves (fatal if CLAUDE_BIN in .env not executable)
-  ├─ sudo systemctl restart bounce-cti
+  ├─ npm ci + npm run build (only if frontend/ changed outside e2e/,
+  │     playwright.config.js and .md files)
+  │       any failure up to here: the checkout is reset to where it was,
+  │       the run fails, nothing is restarted
+  ├─ sudo systemctl restart bounce-cti (only if a path outside the script's
+  │     INERT list changed, or the service is not running)
   └─ health check (verify service is running)
 ```
+
+A restart ends every investigation in flight (they come back as
+`error: interrupted` and can be resumed). It is therefore kept for what the
+running service loads: `backend/` (its tests aside), `requirements.txt`,
+`run_mcp.py`, `mcp.json`, `deploy.sh`, and any path nobody classified. The
+script's `INERT` list names what restarts nothing: top-level `*.md`, `media/`,
+`backend/tests/`, `frontend/`, `eval/`, `runs/`, `.github/`,
+`requirements-dev.txt`, `.env.example`, the ignore files, the Docker files and
+the licence files. The bundle is rebuilt and served from disk by the process
+already running, so a tab that is already open keeps the old bundle until it is
+reloaded (a restart reloads every open tab through the `server_shutdown` frame).
+
+The steps are decided on the diff between the checkout and `origin/main`, which
+is only right if the checkout is what the service runs. So a run that stops
+before its restart resets the checkout to where it was: the service finds on
+disk the code it runs (the MCP processes of each investigation are spawned from
+disk), and the next push, or a re-run of the failed job, redoes everything. For
+a run killed outright, `.git/bounce-deploy-pending` holds the commit it started
+from, from the moment the checkout moves until the deploy is over; a run that
+finds the file starts from that commit.
+
+`backend/tests/test_deploy_script.py` extracts the script from the workflow and
+runs it in a sandbox for each of these cases, and checks `INERT` against the
+files of the repository: a new top-level file fails it until it is classified.
 
 ### Production stack
 

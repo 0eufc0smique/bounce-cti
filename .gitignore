@@ -6,6 +6,9 @@ venv/
 *.db
 node_modules/
 dist/
+dist-demo/
+test-results/
+playwright-report/
 .vite/
 .DS_Store
 data/
